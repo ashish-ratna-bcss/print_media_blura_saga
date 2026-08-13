@@ -1,0 +1,42 @@
+{
+  "_comment": "Newspapers published from / circulating in Delhi-NCR with an e-paper edition. 'host' is the e-paper host to probe; 'alt' are fallbacks tried if the primary is dead.",
+  "papers": [
+    {"name": "The Times of India",   "lang": "en", "group": "Bennett Coleman",   "host": "epaper.timesofindia.com",        "alt": ["epaper.indiatimes.com", "epaperbeta.timesofindia.com"]},
+    {"name": "Hindustan Times",      "lang": "en", "group": "HT Media",          "host": "epaper.hindustantimes.com",      "alt": []},
+    {"name": "The Hindu",            "lang": "en", "group": "The Hindu Group",   "host": "epaper.thehindu.com",            "alt": []},
+    {"name": "The Indian Express",   "lang": "en", "group": "Indian Express",    "host": "epaper.indianexpress.com",       "alt": []},
+    {"name": "The Economic Times",   "lang": "en", "group": "Bennett Coleman",   "host": "epaper.indiatimes.com",          "alt": []},
+    {"name": "Business Standard",    "lang": "en", "group": "Business Standard", "host": "epaper.business-standard.com",   "alt": ["mybs.in"]},
+    {"name": "Mint",                 "lang": "en", "group": "HT Media",          "host": "epaper.livemint.com",            "alt": []},
+    {"name": "Financial Express",    "lang": "en", "group": "Indian Express",    "host": "epaper.financialexpress.com",    "alt": []},
+    {"name": "The Statesman",        "lang": "en", "group": "The Statesman Ltd", "host": "epaper.thestatesman.com",        "alt": []},
+    {"name": "The Pioneer",          "lang": "en", "group": "CMYK Printech",     "host": "epaper.dailypioneer.com",        "alt": []},
+    {"name": "Millennium Post",      "lang": "en", "group": "Millennium Post",   "host": "epaper.millenniumpost.in",       "alt": []},
+    {"name": "The Asian Age",        "lang": "en", "group": "Deccan Chronicle",  "host": "epaper.asianage.com",            "alt": []},
+    {"name": "National Herald",      "lang": "en", "group": "AJL",               "host": "epaper.nationalheraldindia.com", "alt": []},
+    {"name": "The Tribune",          "lang": "en", "group": "Tribune Trust",     "host": "epaper.tribuneindia.com",        "alt": []},
+    {"name": "The Sunday Guardian",  "lang": "en", "group": "iTV Network",       "host": "epaper.sundayguardianlive.com",  "alt": []},
+
+    {"name": "Dainik Jagran",        "lang": "hi", "group": "Jagran Prakashan",  "host": "epaper.jagran.com",              "alt": []},
+    {"name": "Amar Ujala",           "lang": "hi", "group": "Amar Ujala",        "host": "epaper.amarujala.com",           "alt": []},
+    {"name": "Navbharat Times",      "lang": "hi", "group": "Bennett Coleman",   "host": "epaper.navbharattimes.indiatimes.com", "alt": ["nbtepaper.indiatimes.com"]},
+    {"name": "Hindustan (Hindi)",    "lang": "hi", "group": "HT Media",          "host": "epaper.livehindustan.com",       "alt": []},
+    {"name": "Dainik Bhaskar",       "lang": "hi", "group": "DB Corp",           "host": "epaper.bhaskar.com",             "alt": []},
+    {"name": "Punjab Kesari",        "lang": "hi", "group": "Punjab Kesari",     "host": "epaper.punjabkesari.in",         "alt": ["epaper.punjabkesari.com"]},
+    {"name": "Jansatta",             "lang": "hi", "group": "Indian Express",    "host": "epaper.jansatta.com",            "alt": []},
+    {"name": "Rashtriya Sahara",     "lang": "hi", "group": "Sahara India",      "host": "epaper.rashtriyasahara.com",     "alt": ["rashtriyasahara.com"]},
+    {"name": "Veer Arjun",           "lang": "hi", "group": "Veer Arjun",        "host": "epaper.veerarjun.com",           "alt": []},
+    {"name": "Haribhoomi",           "lang": "hi", "group": "Haribhoomi",        "host": "epaper.haribhoomi.com",          "alt": []},
+    {"name": "Nai Dunia",            "lang": "hi", "group": "Jagran Prakashan",  "host": "epaper.naidunia.com",            "alt": []},
+    {"name": "Dainik Tribune",       "lang": "hi", "group": "Tribune Trust",     "host": "epaper.dainiktribuneonline.com", "alt": []},
+    {"name": "Navodaya Times",       "lang": "hi", "group": "Navodaya Times",    "host": "epaper.navodayatimes.in",        "alt": []},
+    {"name": "Deshbandhu",           "lang": "hi", "group": "Deshbandhu",        "host": "epaper.deshbandhu.co.in",        "alt": []},
+    {"name": "Aaj Samaj",            "lang": "hi", "group": "iTV Network",       "host": "epaper.aajsamaj.com",            "alt": []},
+    {"name": "Dainik Savera",        "lang": "hi", "group": "Savera Group",      "host": "epaper.dainiksavera.com",        "alt": []},
+
+    {"name": "Inquilab",             "lang": "ur", "group": "Mid-Day Infomedia", "host": "epaper.inquilab.com",            "alt": []},
+    {"name": "Roznama Sahafat",      "lang": "ur", "group": "Sahafat",           "host": "epaper.sahafat.in",              "alt": []},
+    {"name": "Hamara Samaj",         "lang": "ur", "group": "Hamara Samaj",      "host": "epaper.hamarasamaj.com",         "alt": []},
+    {"name": "Qaumi Awaz",           "lang": "ur", "group": "AJL",               "host": "epaper.qaumiawaz.com",           "alt": []}
+  ]
+}

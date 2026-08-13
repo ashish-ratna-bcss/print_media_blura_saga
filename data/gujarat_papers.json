@@ -1,0 +1,27 @@
+{
+  "_comment": "Newspapers published from / circulating in Gujarat with an e-paper edition. Gujarati unless noted. 'host' is the e-paper host to probe.",
+  "papers": [
+    {"name": "Gujarat Samachar",   "lang": "gu", "group": "Lok Prakashan",      "host": "epaper.gujaratsamachar.com",  "alt": ["gujaratsamachar.com/epaper"]},
+    {"name": "Divya Bhaskar",      "lang": "gu", "group": "DB Corp",            "host": "epaper.divyabhaskar.co.in",   "alt": ["epaper.bhaskar.com"]},
+    {"name": "Sandesh",            "lang": "gu", "group": "Sandesh Ltd",        "host": "epaper.sandesh.com",          "alt": ["sandesh.com/epaper"]},
+    {"name": "Gujarat Mitra",      "lang": "gu", "group": "Gujarat Mitra",      "host": "epaper.gujaratmitra.in",      "alt": []},
+    {"name": "Phulchhab",          "lang": "gu", "group": "Saurashtra Trust",   "host": "epaper.phulchhab.com",        "alt": []},
+    {"name": "Akila",              "lang": "gu", "group": "Akila",              "host": "epaper.akilanews.com",        "alt": ["akilanews.com/epaper"]},
+    {"name": "Kutch Mitra",        "lang": "gu", "group": "Kutch Mitra",        "host": "epaper.kutchmitra.com",       "alt": []},
+    {"name": "Nobat",              "lang": "gu", "group": "Nobat",              "host": "epaper.nobat.com",            "alt": []},
+    {"name": "Jai Hind",           "lang": "gu", "group": "Jai Hind Daily",     "host": "epaper.jaihinddaily.com",     "alt": []},
+    {"name": "Sambhaav Metro",     "lang": "gu", "group": "Sambhaav Media",     "host": "epaper.sambhaavnews.com",     "alt": []},
+    {"name": "Mumbai Samachar",    "lang": "gu", "group": "Bombay Samachar",    "host": "epaper.bombaysamachar.com",   "alt": ["bombaysamachar.com/epaper"]},
+    {"name": "Western Times",      "lang": "gu", "group": "Western Times",      "host": "epaper.westerntimesnews.in",  "alt": []},
+    {"name": "Sardar Gurjari",     "lang": "gu", "group": "Sardar Gurjari",     "host": "epaper.sardargurjari.com",    "alt": []},
+    {"name": "Gujarat Guardian",   "lang": "gu", "group": "Gujarat Guardian",   "host": "epaper.gujaratguardian.in",   "alt": []},
+    {"name": "Garavi Gujarat",     "lang": "gu", "group": "Garavi Gujarat",     "host": "epaper.garavigujarat.biz",    "alt": []},
+    {"name": "Voice of Day",       "lang": "gu", "group": "Voice of Day",       "host": "epaper.voiceofday.com",       "alt": []},
+    {"name": "Aajkaal Gujarat",    "lang": "gu", "group": "Aajkaal",            "host": "epaper.aajkaal.in",           "alt": []},
+    {"name": "Times of India",     "lang": "en", "group": "Bennett Coleman",    "host": "epaper.timesofindia.com",     "alt": ["epaper.indiatimes.com"]},
+    {"name": "The Indian Express", "lang": "en", "group": "Indian Express",     "host": "epaper.indianexpress.com",    "alt": []},
+    {"name": "Ahmedabad Mirror",   "lang": "en", "group": "Times Group",        "host": "epaper.ahmedabadmirror.com",  "alt": []},
+    {"name": "Financial Express",  "lang": "en", "group": "Indian Express",     "host": "epaper.financialexpress.com", "alt": []},
+    {"name": "Divya Bhaskar Hindi","lang": "hi", "group": "DB Corp",            "host": "epaper.bhaskar.com",          "alt": []}
+  ]
+}

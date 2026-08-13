@@ -1,0 +1,17 @@
+# Extraction output: page images, article crops, annotated overlays, PDFs.
+# Regenerable from the pipeline and far too large for git (~560 MB).
+out/
+
+# Web app runtime state: SQLite job history and per-job image files.
+web/data/
+
+# Server-side deployment copies and logs
+web/server.log
+web/*.log
+*.log
+
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
