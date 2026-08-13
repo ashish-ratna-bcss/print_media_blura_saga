@@ -33,6 +33,7 @@ import uuid
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -464,11 +465,6 @@ def run_topic_job(jid, spec):
 
 # ---------------------------------------------------------------- API
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return open(os.path.join(HERE, "ui.html"), encoding="utf-8").read()
-
-
 @app.get("/api/health")
 def health():
     h = local_backend.health()
@@ -619,6 +615,30 @@ def media(jid: str, name: str):
 @app.exception_handler(Exception)
 def on_error(request, exc):
     return JSONResponse({"error": str(exc)[:300]}, status_code=500)
+
+
+# ---------------------------------------------------------------- frontend
+#
+# The React/Vite SPA in web/frontend is prebuilt to web/frontend/dist. Mounted
+# last, after every /api route above, so those routes keep matching first and
+# this mount only catches the rest: "/" -> index.html, "/assets/*" -> the JS
+# and CSS bundle, "/favicon.svg" -> the icon. No server-side routing needed --
+# the whole app is one page that switches views client-side.
+
+FRONTEND_DIST = os.path.join(HERE, "frontend", "dist")
+
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    @app.get("/", response_class=HTMLResponse)
+    def frontend_missing():
+        return HTMLResponse(
+            "<pre>frontend not built.\n\n"
+            "  cd web/frontend\n"
+            "  npm install\n"
+            "  npm run build\n\n"
+            "then restart this server.</pre>",
+            status_code=503)
 
 
 def main():

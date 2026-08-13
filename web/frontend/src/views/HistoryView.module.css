@@ -1,0 +1,89 @@
+.tableWrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.scroll {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  min-width: 760px;
+}
+
+th {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  text-align: left;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+
+td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: middle;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+td.headline {
+  color: var(--text);
+  font-weight: 500;
+}
+
+tr.row {
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+tr.row:hover td {
+  background: var(--surface-2);
+}
+tr.row:last-child td {
+  border-bottom: 0;
+}
+
+.delBtn {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all var(--dur-fast) var(--ease);
+}
+.delBtn:hover {
+  color: var(--bad);
+  border-color: var(--bad);
+  background: var(--bad-soft);
+}
+.delBtn.confirm {
+  color: var(--bad);
+  border-color: var(--bad);
+  background: var(--bad-soft);
+}
+
+.skeletonRow td {
+  padding: 13px 14px;
+}
+.skeletonBar {
+  height: 13px;
+  border-radius: 4px;
+  width: 100%;
+}
