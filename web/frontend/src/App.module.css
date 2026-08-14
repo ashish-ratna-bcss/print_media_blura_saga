@@ -1,0 +1,17 @@
+.page {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 0 24px 90px;
+}
+
+.tabRow {
+  margin: 22px 0 22px;
+}
+
+.panel {
+  display: none;
+}
+.panelActive {
+  display: block;
+  animation: fade-up 0.32s var(--ease);
+}
