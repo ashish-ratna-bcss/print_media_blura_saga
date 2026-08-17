@@ -1,2 +1,42 @@
+# Core: acquisition, stitching, storage. Enough for discover/fetch and the
+# keyword layer, which deliberately needs nothing heavier.
 Pillow>=9.0
 pymongo>=4.0
+
+# Connection settings live in a gitignored .env; epaper/config.py reads it.
+# python-dotenv is optional -- config.py falls back to its own parser -- but
+# without it, quoted values and inline comments are handled less carefully.
+python-dotenv>=1.0
+# Required for MongoDB Atlas's mongodb+srv:// connection strings, which
+# resolve the replica set members by DNS. pymongo does not pull it in, and
+# without it an srv:// URI fails with a ConfigurationError that does not say
+# what is missing.
+dnspython>=2.4
+
+# Web app (web/app.py). python-multipart is not optional -- FastAPI needs it
+# for the UploadFile/Form page upload, and its absence shows up as a 500 at
+# request time rather than an import error at startup.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+
+# Local backend (epaper/local_backend.py): DocLayout-YOLO page segmentation.
+# Pulls torch and torchvision. Install these FIRST from the PyTorch index if
+# you want GPU, otherwise pip resolves the CPU-only build:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+#
+# Then the weights, which are not on PyPI:
+#   huggingface-cli download juliozhao/DocLayout-YOLO-DocStructBench \
+#       doclayout_yolo_docstructbench_imgsz1024.pt
+#   export EPAPER_YOLO=/path/to/doclayout_yolo_docstructbench_imgsz1024.pt
+#
+# Omit these lines if you only need acquisition, PDF assembly or keyword search.
+doclayout-yolo>=0.0.4
+# doclayout-yolo 0.0.4 imports huggingface_hub but does not declare it, so a
+# clean install fails at "from huggingface_hub import PyTorchModelHubMixin".
+# Listed explicitly until upstream fixes its metadata.
+huggingface_hub>=0.20
+
+# The vision model is NOT a Python dependency -- it is a separate server.
+# See README "Local backend": ollama pull qwen2.5vl:7b (or :3b under ~4GB VRAM).

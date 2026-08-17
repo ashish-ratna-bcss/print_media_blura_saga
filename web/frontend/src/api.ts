@@ -1,10 +1,15 @@
 import type {
+  Beat,
+  CorpusStats,
   DateOption,
   Edition,
+  Expansion,
   HealthStatus,
   JobDetail,
   JobRow,
   Paper,
+  SearchResponse,
+  TopicMode,
 } from "./types";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -46,16 +51,40 @@ export interface TopicSearchPayload {
   edition: string;
   max_pages: number;
   min_score?: number;
+  mode?: TopicMode;
 }
 
 export const api = {
   health: () => req<HealthStatus>("/api/health"),
   papers: () => req<Paper[]>("/api/papers"),
+  beats: () => req<Beat[]>("/api/beats"),
+  expand: (topic: string) => req<Expansion>(`/api/expand?topic=${encodeURIComponent(topic)}`),
   editions: (host: string) => req<Edition[]>(`/api/editions?host=${encodeURIComponent(host)}`),
   dates: (host: string, titleId: string) =>
     req<DateOption[]>(
       `/api/dates?host=${encodeURIComponent(host)}&title_id=${encodeURIComponent(titleId)}`,
     ),
+
+  corpus: () => req<CorpusStats>("/api/corpus"),
+  backfill: () =>
+    req<{ added: number; updated: number; skipped: number; jobs: number }>(
+      "/api/corpus/backfill",
+      { method: "POST" },
+    ),
+  search: (params: {
+    q: string;
+    paper?: string;
+    beat?: string;
+    date_from?: string;
+    date_to?: string;
+    limit?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== "" && v !== null) qs.set(k, String(v));
+    });
+    return req<SearchResponse>(`/api/search?${qs.toString()}`);
+  },
 
   jobs: (limit = 60) => req<JobRow[]>(`/api/jobs?limit=${limit}`),
   job: (id: string) => req<JobDetail>(`/api/jobs/${encodeURIComponent(id)}`),
@@ -73,7 +102,10 @@ export const api = {
     req<{ job_id: string }>("/api/jobs/fetch", json(payload)),
 
   topicSearch: (payload: TopicSearchPayload) =>
-    req<{ job_id: string; platform: string }>("/api/jobs/topic", json(payload)),
+    req<{ job_id: string; platform: string; mode: TopicMode; beat: string | null; n_terms: number }>(
+      "/api/jobs/topic",
+      json(payload),
+    ),
 
   mediaUrl: (jobId: string, name: string) =>
     `/api/media/${encodeURIComponent(jobId)}/${encodeURIComponent(name)}`,

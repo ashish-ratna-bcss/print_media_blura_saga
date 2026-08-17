@@ -1,22 +1,29 @@
 """
 Topic filtering: pull only the stories about one subject out of a whole edition.
 
-Two stages, because the cost of the two questions is wildly different.
+Three stages now, cheapest first, because the cost of the questions is wildly
+different and most stories can be settled by the cheap ones.
 
-  SCREEN   A cheap text-model pass over every story's opening text, in batches,
-           answering only "could this plausibly be about the topic?". Tuned to
-           over-include: a story wrongly dropped here is gone for good, while a
-           story wrongly kept costs one assess call.
+  PREFILTER  Free. keywords.py scores every story against a hand-built beat
+             vocabulary and drops only those that matched nothing at all while
+             having enough text for that to mean something. No model involved.
 
-  ASSESS   The survivors go one at a time to the text model, which decides
-           relevance properly and says why. This is where precision comes from.
+  SCREEN     A cheap text-model pass over the survivors' opening text, in
+             batches, answering only "could this plausibly be about the topic?".
+             Tuned to over-include: a story wrongly dropped here is gone for
+             good, while a story wrongly kept costs one assess call.
 
-Screening first matters. A front section can hold 60 stories; assessing all of
-them costs 60 calls, while screening 60 headlines costs two and usually leaves
-under ten to assess.
+  ASSESS     The survivors go one at a time to the text model, which decides
+             relevance properly and says why. This is where precision comes from.
 
-Both stages run on the text model (qwen2.5:7b by default), not the vision one.
-Deciding whether a story is about policing does not require looking at the page.
+Ordering matters. A front section can hold 60 stories; assessing all of them
+costs 60 calls, while the prefilter is free, screening what is left costs two,
+and under ten usually reach assess.
+
+The two model stages run on the text model (qwen2.5:7b by default), not the
+vision one. Deciding whether a story is about policing does not require looking
+at the page -- and with a resolved beat, often does not require a model at all
+(see mode="keywords" in find()).
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import vlm
+from . import keywords, vlm
 
 SCREEN_BATCH = 25
 
@@ -72,24 +79,38 @@ def _opening(a, limit=340):
         str(a.get(k) or "") for k in ("headline", "summary", "body")))[:limit]
 
 
-def screen(articles: list, topic: str, progress=None) -> list:
-    """Indices of articles worth assessing. Fails open: on error, keep all."""
+def screen(articles: list, topic: str, progress=None, spec=None,
+           prefilter: bool = True) -> list:
+    """
+    Indices of articles worth assessing. Fails open: on error, keep all.
+
+    The free keyword prefilter runs first unless disabled, so the model only
+    sees stories with at least some lexical evidence. Batches are numbered
+    locally and mapped back through `cand`, so a model that renumbers or skips
+    cannot silently shift which article a number refers to.
+    """
+    spec = keywords.expand(topic) if spec is None else spec
+    cand = (keywords.prefilter(articles, spec)["keep"] if prefilter
+            else list(range(len(articles))))
+
     keep = []
-    for start in range(0, len(articles), SCREEN_BATCH):
-        chunk = articles[start:start + SCREEN_BATCH]
-        listing = "\n".join("%d. %s" % (start + i + 1, _opening(a))
-                            for i, a in enumerate(chunk))
+    for start in range(0, len(cand), SCREEN_BATCH):
+        chunk = cand[start:start + SCREEN_BATCH]
+        listing = "\n".join("%d. %s" % (k + 1, _opening(articles[i]))
+                            for k, i in enumerate(chunk))
         try:
             out = vlm.text_json(SCREEN_PROMPT % (topic, listing), max_tokens=600)
-            nums = out.get("keep") or []
-            keep += [int(n) - 1 for n in nums
-                     if isinstance(n, (int, str)) and str(n).strip().isdigit()]
+            for n in (out.get("keep") or []):
+                if isinstance(n, (int, str)) and str(n).strip().isdigit():
+                    k = int(str(n).strip()) - 1
+                    if 0 <= k < len(chunk):
+                        keep.append(chunk[k])
         except Exception:
             # A screening failure must not silently discard a whole batch.
-            keep += list(range(start, start + len(chunk)))
+            keep += chunk
         if progress:
-            progress(min(start + SCREEN_BATCH, len(articles)), len(articles))
-    return sorted({i for i in keep if 0 <= i < len(articles)})
+            progress(min(start + SCREEN_BATCH, len(cand)), len(cand))
+    return sorted(set(keep))
 
 
 def assess(article: dict, topic: str) -> dict:
@@ -119,19 +140,35 @@ def assess(article: dict, topic: str) -> dict:
 
 
 def find(articles: list, topic: str, min_score: float = 0.5,
-         progress=None) -> dict:
+         progress=None, mode: str = "hybrid") -> dict:
     """
     Full filter over one edition's articles.
 
-    Returns matches sorted by score, plus counts so the UI can show how much
-    was searched rather than only what survived.
+    mode="hybrid"    keyword prefilter, then model screen, then model assess.
+                     Slow and precise; the default.
+    mode="keywords"  lexical only, no model call at all. Seconds instead of
+                     minutes, and it still works when the model server is down,
+                     but it cannot tell a police story from a story quoting a
+                     policeman. Only meaningful for a resolved beat -- an
+                     unexpanded free-text query has no vocabulary to match.
+
+    Returns matches sorted by score, plus counts so the UI can show how much was
+    searched rather than only what survived.
     """
+    spec = keywords.expand(topic)
+    base = {"topic": topic, "mode": mode, "beat": spec["beat"],
+            "expanded": spec["expanded"], "terms": spec["terms"]}
     if not articles:
-        return {"topic": topic, "searched": 0, "screened": 0, "matches": []}
+        return {**base, "searched": 0, "screened": 0, "matches": []}
+
+    if mode == "keywords":
+        matches = keywords.rank(articles, spec, min_score)
+        return {**base, "searched": len(articles),
+                "screened": len(articles), "matches": matches}
 
     if progress:
         progress("screening", 0, len(articles))
-    cand = screen(articles, topic,
+    cand = screen(articles, topic, spec=spec,
                   progress=(lambda d, t: progress("screening", d, t)) if progress else None)
 
     matches = []
@@ -140,10 +177,17 @@ def find(articles: list, topic: str, min_score: float = 0.5,
             progress("assessing", n, len(cand))
         a = articles[i]
         v = assess(a, topic)
-        if v["relevant"] and v["score"] >= min_score:
-            matches.append({**a, "topic_score": round(v["score"], 2),
-                            "topic_why": v["why"], "topic_summary": v["summary"],
-                            "entities": v["entities"]})
+        # The beat's geography applies to the model's verdict as well; see
+        # keywords.adjust for why this cannot live inside keywords.score alone.
+        adj = keywords.adjust(v["score"], a, spec)
+        if v["relevant"] and adj["score"] >= min_score:
+            why = v["why"]
+            if adj["reason"]:
+                why = "%s [scored down: %s]" % (why, adj["reason"])
+            matches.append({**a, "topic_score": adj["score"],
+                            "topic_why": why, "topic_summary": v["summary"],
+                            "entities": v["entities"],
+                            "keywords": adj["hits"]})
     matches.sort(key=lambda m: -m["topic_score"])
-    return {"topic": topic, "searched": len(articles),
+    return {**base, "searched": len(articles),
             "screened": len(cand), "matches": matches}

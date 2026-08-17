@@ -1,0 +1,160 @@
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+}
+.grow {
+  flex: 1 1 260px;
+}
+.narrow {
+  flex: 0 0 150px;
+}
+
+/* Wider than .narrow: this one holds a search field, not a date. */
+.beatCol {
+  flex: 0 0 215px;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  flex: 1 1 auto;
+  margin: 0;
+}
+.bad {
+  color: var(--ad);
+}
+.err {
+  margin: 12px 0 0;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.summary {
+  font-size: 12.5px;
+  color: var(--text-2);
+  margin: 0 0 2px;
+}
+
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.hit {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  padding: 15px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: var(--shadow-sm);
+}
+
+.hitTop {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.score {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+.hl {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.mono {
+  font-family: var(--mono);
+}
+
+.offPatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ad);
+  border: 1px solid color-mix(in srgb, var(--ad) 40%, var(--border));
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10.5px;
+}
+
+.body {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.bar {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+}
+
+.kw {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+
+.crop {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border-soft);
+  margin-top: 2px;
+}

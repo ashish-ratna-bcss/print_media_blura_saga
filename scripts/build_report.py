@@ -107,7 +107,8 @@ def main():
         src.close()
 
     dest = os.path.join(ROOT, "out/report_assets.json")
-    json.dump(out, open(dest, "w"), ensure_ascii=False)
+    with open(dest, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, ensure_ascii=False)
     mb = os.path.getsize(dest) / 1e6
     print("wrote %s (%.1f MB)" % (dest, mb), file=sys.stderr)
     for p in out["pages"]:

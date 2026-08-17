@@ -203,9 +203,10 @@ def main():
             if args.backend == "local" and page_articles:
                 dd = detector.debug_dir_for(paper, pg["date"], pg["page_no"])
                 os.makedirs(dd, exist_ok=True)
-                json.dump(page_articles,
-                          open(os.path.join(dd, "articles.json"), "w"),
-                          ensure_ascii=False, indent=1, default=str)
+                with open(os.path.join(dd, "articles.json"), "w",
+                          encoding="utf-8") as fh:
+                    json.dump(page_articles, fh, ensure_ascii=False,
+                              indent=1, default=str)
             n_clip += placed
             n_draft += placed if src == "geometric" else 0
             store.db.pages.update_one({"_id": pg["_id"]}, {"$set": {"segmented": True}})

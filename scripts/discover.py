@@ -21,7 +21,8 @@ def main():
         if r in args:
             region = r
             args.remove(r)
-    cfg = json.load(open(os.path.join(ROOT, "data/%s_papers.json" % region)))
+    cfg = json.load(open(os.path.join(ROOT, "data/%s_papers.json" % region),
+                         encoding="utf-8"))
     papers = cfg["papers"]
     if args:
         needles = [a.lower() for a in args]

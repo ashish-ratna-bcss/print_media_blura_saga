@@ -42,7 +42,7 @@ import urllib.request
 
 from PIL import Image, ImageDraw
 
-from . import vlm
+from . import ocr, vlm
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -108,11 +108,29 @@ def _remote_elements(page_path: str, conf: float) -> list:
     return out["elements"]
 
 
+def _default_device() -> str:
+    """
+    Prefer the GPU, but fall back to CPU instead of raising.
+
+    This is not the kind of fallback the module refuses elsewhere. Downgrading
+    the *detector* changes the answer and is banned; downgrading the *device*
+    only changes how long the same answer takes. A CPU-only torch build is a
+    legitimate install -- DocLayout-YOLO is small enough to run on one, and on
+    a 4GB card it is arguably the better split, since it leaves the whole GPU
+    to the VLM. Force either way with EPAPER_DEVICE=cpu|cuda:0.
+    """
+    try:
+        import torch
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 def detect_elements(page_path: str, conf: float = 0.20, device: str = None) -> list:
     """Document elements with pixel boxes, numbered in reading order."""
     if LAYOUT_URL:
         return _remote_elements(page_path, conf)
-    device = device or os.environ.get("EPAPER_DEVICE", "cuda:0")
+    device = device or os.environ.get("EPAPER_DEVICE") or _default_device()
     try:
         res = _yolo().predict(page_path, imgsz=1024, conf=conf,
                               device=device, verbose=False)[0]
@@ -280,13 +298,46 @@ Return ONLY JSON:
 
 
 def _read_headline(page_path, box, pad=8):
-    """Read one headline. A small crop, so this is fast and hard to get wrong."""
+    """
+    Read one headline.
+
+    This runs once per title candidate, and there are more of those than the
+    "a small crop, so this is fast" comment suggested: 18 on a Tribune front
+    page, ~19 s each through the vision model, which profiling put at 344 s of
+    a 475 s extraction -- 72% of the whole job.
+
+    So OCR reads it by default. The README's case against OCR is about raster
+    order over a whole page, which does not apply once YOLO has isolated a
+    single headline box; what is left is a strip of large bold type. Tesseract
+    does that in milliseconds on CPU.
+
+    The cost is the `is_ad` flag, which only the VLM prompt produced. Ad
+    detection falls back to the geometric figure-ratio test alone, which is
+    weaker. EPAPER_HEADLINE=vlm restores the old behaviour; =auto uses OCR and
+    retries with the VLM only when OCR returns nothing legible.
+    """
     from PIL import Image as _I
     with _I.open(page_path) as im:
         x0, y0, x1, y1 = box
         crop = im.convert("RGB").crop((max(0, x0 - pad), max(0, y0 - pad),
                                        min(im.width, x1 + pad),
                                        min(im.height, y1 + pad)))
+
+    # "ocr" by default. "auto" was tried and abandoned: only 3 of 18 crops
+    # triggered a fallback, but at 7-20 s each they ate the saving, leaving
+    # 1.8x instead of 16x. The deciding evidence was that the model garbles the
+    # same words -- it returned "Proud oftaggiven" and "PChidambaram" too --
+    # so paying for it buys differently-broken text, not correct text. The
+    # fused-run matching in keywords.py handles the damage instead, on both
+    # engines' output. "auto" and "vlm" remain available.
+    mode = os.environ.get("EPAPER_HEADLINE", "ocr").lower()
+    if mode in ("ocr", "auto"):
+        text = ocr.read_headline(crop)
+        if mode == "ocr":
+            return text, False
+        if text and not ocr.looks_unreliable(text):
+            return text, False
+
     try:
         d = vlm.chat_json(HEADLINE_PROMPT, crop, max_edge=900, max_tokens=300)
     except Exception:
@@ -368,6 +419,15 @@ def group_articles(page_path: str, elements: list) -> list:
             "headline_visible": headline,
             "continued_on_page": None,
             "package": False,
+            # Per-element boxes, kept rather than collapsed into the article
+            # bbox. The union box is enough to crop, but not enough to point a
+            # reader at the headline inside it, and this is the only place the
+            # member geometry still exists. `text` is filled for the headline
+            # only -- body text per region needs OCR, which does not run here.
+            "region_boxes": (
+                [{"type": "headline", "bbox": list(t["bbox_px"]), "text": headline}]
+                + [{"type": m["kind"], "bbox": list(m["bbox_px"]), "text": ""}
+                   for m in members]),
             "elements": sorted([t["n"]] + [m["n"] for m in members]),
             "element_kinds": kinds,
             "has_photo": any(m["kind"] == "figure" for m in members),
@@ -568,12 +628,16 @@ def detect_regions(page_path: str, page_no: int = 1, paper: str = "", date: str 
     if debug:
         dd = debug_dir_for(paper or "page", date or "", page_no)
         os.makedirs(dd, exist_ok=True)
-        json.dump({"page": page_path, "size": [W, H], "elements": elements},
-                  open(os.path.join(dd, "elements.json"), "w"),
-                  ensure_ascii=False, indent=1)
-        json.dump({"page": page_path, "articles": arts},
-                  open(os.path.join(dd, "grouping.json"), "w"),
-                  ensure_ascii=False, indent=1)
+        # encoding="utf-8" explicitly: open() would otherwise use the locale
+        # encoding, and cp1252 cannot represent the Devanagari these files are
+        # full of. Pairing that default with ensure_ascii=False raises rather
+        # than writing mojibake.
+        with open(os.path.join(dd, "elements.json"), "w", encoding="utf-8") as fh:
+            json.dump({"page": page_path, "size": [W, H], "elements": elements},
+                      fh, ensure_ascii=False, indent=1)
+        with open(os.path.join(dd, "grouping.json"), "w", encoding="utf-8") as fh:
+            json.dump({"page": page_path, "articles": arts},
+                      fh, ensure_ascii=False, indent=1)
         _annotate(page_path,
                   [e["bbox_px"] for e in elements],
                   [ELEMENT_COLORS.get(e["kind"], (120, 120, 130)) for e in elements],
