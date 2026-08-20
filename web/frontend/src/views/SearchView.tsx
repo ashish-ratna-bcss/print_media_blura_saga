@@ -179,7 +179,7 @@ export function SearchView({ active }: { active: boolean }) {
               </div>
               <p className={styles.meta}>
                 {r.paper}
-                {r.edition ? ` · ${r.edition}` : ""} · {r.date} · page {r.page_no} ·{" "}
+                {r.edition ? ` · ${r.edition}` : ""} · {r.date} · page {r.page_number} ·{" "}
                 <span className={styles.mono}>{r.text_source}</span> · {r.lang}
                 {r.off_patch && (
                   <span className={styles.offPatch}>

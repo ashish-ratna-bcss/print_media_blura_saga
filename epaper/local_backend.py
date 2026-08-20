@@ -297,7 +297,7 @@ Return ONLY JSON:
 {"headline":"<text as printed>","is_ad":<true|false>}"""
 
 
-def _read_headline(page_path, box, pad=8):
+def _read_headline(page_path, box, pad=8, lang=None):
     """
     Read one headline.
 
@@ -332,7 +332,7 @@ def _read_headline(page_path, box, pad=8):
     # engines' output. "auto" and "vlm" remain available.
     mode = os.environ.get("EPAPER_HEADLINE", "ocr").lower()
     if mode in ("ocr", "auto"):
-        text = ocr.read_headline(crop)
+        text = ocr.read_headline(crop, lang=lang)
         if mode == "ocr":
             return text, False
         if text and not ocr.looks_unreliable(text):
@@ -373,7 +373,7 @@ def _figure_ratio(members, box):
     return fig / float(area)
 
 
-def group_articles(page_path: str, elements: list) -> list:
+def group_articles(page_path: str, elements: list, lang=None) -> list:
     """Title-anchored grouping: geometry proposes, the VLM reads each headline."""
     from PIL import Image as _I
     with _I.open(page_path) as im:
@@ -384,7 +384,7 @@ def group_articles(page_path: str, elements: list) -> list:
     texts = {}
     for e in elements:
         if e["kind"] in TITLE_KINDS:
-            texts[e["n"]] = _read_headline(page_path, e["bbox_px"])
+            texts[e["n"]] = _read_headline(page_path, e["bbox_px"], lang=lang)
     # Byline rejection is DISABLED. Removing byline-shaped titles from the
     # candidate pool shifts the median that sets the height floor, which
     # changes which real headlines survive as anchors. Measured on Statesman
@@ -564,18 +564,71 @@ Transcribe what is printed. Keep the original script and language. Do not
 summarise, do not translate, do not invent text that is cut off at the edge.
 Use null for any field that is not present.
 
+The values below in <angle brackets> describe the TYPE of content expected.
+They are placeholders. Never copy them into your answer.
+
 Return ONLY JSON:
-{"headline":"...","subheadline":null,"kicker":null,"byline":null,
- "dateline":null,"location":null,
- "body":"full body text, paragraphs separated by blank lines",
+{"headline":"<headline exactly as printed>","subheadline":null,"kicker":null,
+ "byline":null,"dateline":null,"location":null,
+ "body":"<every paragraph of the body text, blank line between paragraphs>",
  "photo_captions":[],"continued_on_page":null,
  "category":"politics|crime|business|sports|civic|health|education|world|entertainment|other",
  "transcription_confidence":0.0}"""
 
 
+# What the model returns when it describes the field instead of filling it.
+# The prompt now says not to, and GROUP_PROMPT has carried that warning all
+# along, but a 7B model still does it occasionally and the result is worse
+# than an empty body: it is fluent English that gets indexed, searched and
+# shown to a reader as though it were the article. Observed once on a Jansatta
+# page, stored in MongoDB, and only caught by eye.
+_PLACEHOLDER_HINTS = (
+    "paragraphs separated by blank lines",
+    "blank line between paragraphs",
+    "every paragraph of the body",
+    "full body text",
+    "headline exactly as printed",
+    "headline text as printed",
+    "headline as printed",
+)
+
+# Long enough that a real article quoting one of these phrases survives, short
+# enough that a bare echo of the schema does not. A transcribed newspaper
+# article is hundreds of characters; a placeholder is a few dozen.
+_PLACEHOLDER_MAX = 120
+
+
+def _real(text, field: str) -> str:
+    """
+    Drop a value that describes the field instead of filling it.
+
+    Matched literally rather than by pattern, because the strings to catch are
+    known exactly: they are the ones written into READ_PROMPT above. A pattern
+    general enough to catch paraphrases would eventually eat a real sentence,
+    and silently deleting an article is worse than keeping one bad one.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    bare = t.strip("<>").strip()
+    low = bare.lower()
+    echoed = (t.startswith("<") and t.endswith(">")) or (
+        len(bare) <= _PLACEHOLDER_MAX
+        and any(h in low for h in _PLACEHOLDER_HINTS))
+    if echoed:
+        print("transcribe: model echoed the %s placeholder, discarding %r"
+              % (field, bare[:70]))
+        return ""
+    return t
+
+
 def transcribe(crop_path: str) -> dict:
     """Read one article crop into structured fields."""
-    return vlm.chat_json(READ_PROMPT, crop_path, max_edge=1280, max_tokens=3000)
+    out = vlm.chat_json(READ_PROMPT, crop_path, max_edge=1280, max_tokens=3000)
+    if isinstance(out, dict):
+        for field in ("headline", "body"):
+            out[field] = _real(out.get(field), field)
+    return out
 
 
 # -- inspection artefacts -------------------------------------------------
@@ -602,7 +655,7 @@ def debug_dir_for(paper, date, page_no) -> str:
 # -- orchestration --------------------------------------------------------
 
 def detect_regions(page_path: str, page_no: int = 1, paper: str = "", date: str = "",
-                   debug: bool = True) -> list:
+                   debug: bool = True, lang: str | None = None) -> list:
     """
     Drop-in replacement for segment.detect_regions / autosegment.detect_regions.
 
@@ -614,7 +667,7 @@ def detect_regions(page_path: str, page_no: int = 1, paper: str = "", date: str 
         raise LocalBackendError("DocLayout-YOLO found no elements on %s"
                                 % os.path.basename(page_path))
 
-    arts = group_articles(page_path, elements)
+    arts = group_articles(page_path, elements, lang=lang)
 
     with Image.open(page_path) as im:
         W, H = im.size

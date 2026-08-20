@@ -130,6 +130,19 @@ CATALOGUE = [
 
 def platform_of(host):
     return next((p["platform"] for p in CATALOGUE if p["host"] == host), "readwhere")
+
+
+def lang_of(host):
+    """
+    The language this title is printed in, for the OCR engine.
+
+    The catalogue already records it, and headline recognition is the one place
+    that has to know: `eng+hin` over an English broadsheet lets Tesseract pick
+    Devanagari for Latin type, which it did -- a Tribune headline came back as
+    "ol cr for एम र नि". Unknown hosts (uploads) return "" and keep the
+    configured default.
+    """
+    return next((p.get("lang", "") for p in CATALOGUE if p["host"] == host), "")
 _cache = {}
 
 
@@ -389,7 +402,7 @@ def run_job(jid, spec):
         regions = local_backend.detect_regions(
             page, spec.get("page_no") or 1,
             paper=spec.get("paper", "upload"), date=spec.get("date", ""),
-            debug=False)
+            debug=False, lang=lang_of(spec.get("host")))
 
         set_job(jid, stage="cropping")
         overlay(page, regions, os.path.join(d, "overlay.jpg"))
@@ -563,7 +576,8 @@ def collect_images(jid, host, title_id, date, max_pages, d):
         try:
             if not os.path.exists(page):
                 fetch_page(host, title_id, date, pno, page)
-            regions = local_backend.detect_regions(page, pno, debug=False)
+            regions = local_backend.detect_regions(page, pno, debug=False,
+                                                   lang=lang_of(host))
         except Exception as ex:
             # Skipped pages have to reach the UI. A gated title silently
             # yielding one page out of fourteen looks identical to a thin
@@ -649,7 +663,8 @@ def run_topic_job(jid, spec):
                         spec.get("max_pages") or 2, d):
                     set_job(jid, stage="reading page %d" % pno)
                     try:
-                        regions = local_backend.detect_regions(page, pno, debug=False)
+                        regions = local_backend.detect_regions(
+                            page, pno, debug=False, lang=lang_of(spec["host"]))
                     except Exception as ex:
                         print("page %s failed: %s" % (pno, ex))
                         continue
@@ -1174,8 +1189,21 @@ def corpus_backfill():
         raise HTTPException(503, "corpus unavailable: %s" % (_corpus_err or "mongodb down"))
     total = {"added": 0, "updated": 0, "skipped": 0, "jobs": 0}
     with db() as conn:
+        # Oldest first, explicitly. An article dedupes on a uid keyed to page
+        # geometry rather than text, so every extraction of one page writes to
+        # the same document and the last write wins. Re-extracting a page after
+        # fixing the reader therefore leaves several rows in SQLite holding the
+        # same story at different quality -- observed here as three jobs for
+        # Tribune p1, two carrying "SCtellsSIT" and one "SC tells SIT".
+        #
+        # Unordered, which row landed last was whatever the database happened
+        # to return, so this button could silently revert a headline to an
+        # older, worse reading of it. It worked only because SQLite returns
+        # insertion order when not asked otherwise, which is not a guarantee to
+        # rely on for something that overwrites the corpus.
         jobs = conn.execute(
-            "SELECT id,paper,edition,date,page_no FROM jobs WHERE status='done'"
+            "SELECT id,paper,edition,date,page_no FROM jobs "
+            "WHERE status='done' ORDER BY created"
         ).fetchall()
         for j in jobs:
             arts = [dict(a) for a in conn.execute(

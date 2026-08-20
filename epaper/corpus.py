@@ -66,6 +66,11 @@ from . import config, keywords
 # the terms mean.
 W_LEX, W_BEAT = 0.40, 0.60
 
+# Per residual word found, added to a beat hit's score. Small on purpose: the
+# beat vocabulary is still what decides relevance, and one extra word the
+# reader happened to type should reorder the list, not rewrite it.
+RESIDUAL_BONUS = 0.12
+
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _PUNCT = re.compile(r"[^\w\sऀ-ॿ]+")
 
@@ -340,8 +345,17 @@ class Corpus:
             if date_to:
                 flt["date"]["$lte"] = date_to
 
+        # A force picked in the dropdown outranks one inferred from the words
+        # typed: the first is a statement of intent, the second is a guess made
+        # by matching an alias anywhere in the query. The guess used to
+        # overwrite it, so choosing a force did nothing at all whenever the
+        # query happened to name one -- picking "Jharkhand Police" and typing
+        # "delhi police" returned Delhi's articles and silently dropped
+        # Jharkhand's.
+        active = beat or spec["beat"]
+
         cap = max(limit * 4, 200)
-        if spec["expanded"]:
+        if active:
             # Fast path. The score is already stored per article, so Mongo
             # ranks and truncates and only `limit` rows come back -- no
             # over-fetch, and no rescoring in Python at all.
@@ -353,14 +367,28 @@ class Corpus:
             # the beat that actually claims the article does the work in the
             # index instead. Off-patch stories drop out rather than trailing at
             # 0.20, which is also what someone who picked a force wants.
-            field = "beat_scores.%s" % spec["beat"]
-            flt["beats"] = spec["beat"]
-            rows = list(self.articles.find(flt)
-                        .sort(field, DESCENDING).limit(limit))
+            field = "beat_scores.%s" % active
+            # dict(flt, ...) rather than flt["beats"] = ...: the filter has to
+            # survive this pass unmodified, because the text fallback below
+            # reuses it and must not inherit a beat restriction that just
+            # failed to match anything.
+            # Over-fetch rather than taking `limit` straight from Mongo. The
+            # final order is not the stored score alone -- geography tiers
+            # above it, and the reader's residual words adjust it -- so
+            # truncating in the database would drop rows that belong at the
+            # top before either had been applied.
+            rows = list(self.articles.find(dict(flt, beats=active))
+                        .sort(field, DESCENDING).limit(cap))
+            # With a force chosen from the dropdown the query text was never
+            # consumed by an alias, so the whole of it is residual -- otherwise
+            # picking a force and typing "election" would rank by beat score
+            # alone and ignore the word entirely.
+            resid = (spec.get("residual") or []) if spec["expanded"] \
+                else (spec.get("terms") or [])
             out = []
             for r in rows:
                 sc = (r.get("beat_scores") or {})
-                blended = sc.get(spec["beat"])
+                blended = sc.get(active)
                 if blended is None:
                     # Written before scores were precomputed: fall back rather
                     # than drop the row, and let a backfill fix it properly.
@@ -370,29 +398,106 @@ class Corpus:
                     blended = round(W_LEX * lexs + W_BEAT * s["score"], 3)
                     hit = _hit(r, blended, lexs, s)
                 else:
-                    hit = _stored_hit(r, blended, spec["beat"])
+                    hit = _stored_hit(r, blended, active)
+                # The reader's own words, which the beat name did not consume.
+                # They RANK rather than select: an article missing the extra
+                # word is still on the beat and still worth returning, just
+                # lower down. Requiring it would throw away the recall the
+                # vocabulary exists to provide.
+                if resid:
+                    blended = round(min(1.0, blended + RESIDUAL_BONUS *
+                                        _residual_hits(r, resid)), 3)
+                    hit["score"] = blended
                 if blended >= min_score:
                     out.append(hit)
-            out.sort(key=lambda x: -x["score"])
-            took = (_dt.datetime.now() - t0).total_seconds() * 1000
-            res = {"query": query, "beat": spec["beat"], "expanded": True,
-                   "terms": len(spec["terms"]), "scanned": len(rows),
-                   "total": len(out), "took_ms": round(took, 1),
-                   "results": out}
-            if record:
-                self._record(res, paper, date_from, date_to, beat)
-            return res
+            if out:
+                # Geography first, then score. A story that names this force's
+                # own patch is its story; a placeless one merely could be, and
+                # is tagged to all 36 forces precisely because there is nothing
+                # to tell them apart. Ranking the two on a single number let
+                # the placeless story win whenever its vocabulary was heavier
+                # -- "Speed up Ram Temple donation probe, SC tells SIT" came
+                # back above "Jharkhand scraps exams" for the query
+                # "jharkhand", 0.472 against 0.43, and no amount of tuning the
+                # weight fixes that, because the two are not the same kind of
+                # evidence. Within each tier the score still orders.
+                out.sort(key=lambda x: (0 if x.get("on_patch") else 1,
+                                        -x["score"]))
+                took = (_dt.datetime.now() - t0).total_seconds() * 1000
+                res = {"query": query, "beat": active,
+                       "expanded": spec["expanded"],
+                       "terms": len(spec["terms"]), "scanned": len(rows),
+                       "loose": False,
+                       "total": len(out), "took_ms": round(took, 1),
+                       "results": out[:limit]}
+                if record:
+                    self._record(res, paper, date_from, date_to, beat)
+                return res
+            # Nothing carries this beat's tag, so fall through to the text
+            # index rather than answering "nothing found".
+            #
+            # Tagging happens at ingest, which means the set of articles a beat
+            # query can ever reach was fixed before the question was asked.
+            # Anything indexed before a vocabulary change, or whose headline
+            # OCR mangled, carries no tag and was unreachable by that route
+            # forever -- while plainly containing the word the reader typed.
+            # The words on the page are still there to be searched, so search
+            # them instead of reporting an empty corpus.
 
         # Free text has no precomputed score -- there is no vocabulary to have
         # scored against -- so this path still over-fetches and rescores.
-        if True:
-            words = [w for w in _PUNCT.sub(" ", query).split() if w]
-            if not words:
-                return self._empty(query, spec)
-            flt["$text"] = {"$search": " ".join(words)}
-            rows = list(self.articles
-                        .find(flt, {"score": {"$meta": "textScore"}})
-                        .sort([("score", {"$meta": "textScore"})]).limit(cap))
+        words = [w for w in _PUNCT.sub(" ", query).split() if w]
+        if not words:
+            return self._empty(query, spec)
+        rows = list(self.articles
+                    .find(dict(flt, **{"$text": {"$search": " ".join(words)}}),
+                          {"score": {"$meta": "textScore"}})
+                    .sort([("score", {"$meta": "textScore"})]).limit(cap))
+
+        # Recall net. The text index carries default_language "none", which is
+        # right for a bilingual corpus and means Mongo does no stemming at all:
+        # `case` and `cases` are unrelated tokens, so a story headlined "CBI
+        # charges husband" is invisible to a search for "charge". The article
+        # is in the database and the search says nothing is there, which is the
+        # worst answer available because it looks like an empty corpus.
+        #
+        # The module docstring claims the keyword layer's prefix matching
+        # covers morphology. It does not cover this path: that layer only
+        # rescores rows $text already returned, so it cannot rescue a query
+        # that matched nothing, and its prefix rule applies to Devanagari only.
+        #
+        # So: exact and indexed first, unchanged and just as fast. Only when it
+        # comes back empty does this scan with a trimmed prefix. A query that
+        # already found something never pays for it.
+        # Run the loose pass when the exact one found nothing, and ALSO when
+        # the reader typed an inflected word -- those are the two ways this
+        # index loses documents, and only the first looks like a failure.
+        #
+        # The second is quieter and worse. "court" returns three articles and
+        # "courts" returns two, because the third says only the singular; the
+        # reader sees a plausible answer and never learns it was short. An
+        # empty result at least invites a retry.
+        #
+        # Only inflected queries pay for the scan. "court" stems to itself, so
+        # it takes the indexed path alone; "courts" stems to "court" and gets
+        # both. That is also what makes the pair agree, which is the point --
+        # a reader should not have to guess which form the paper used.
+        stems = [_stem(w) for w in words]
+        loose = False
+        if not rows or any(s != w.lower() for s, w in zip(stems, words)):
+            wider = list(self.articles.find(
+                dict(flt, **{"$or": [_loose_clause(w) for w in words]})
+            ).limit(cap))
+            if not rows:
+                rows, loose = wider, bool(wider)
+            else:
+                seen = {r.get("uid") for r in rows}
+                extra = [r for r in wider if r.get("uid") not in seen]
+                if extra:
+                    # No textScore on these, so they rank below the exact
+                    # matches once rescored. Looser evidence, lower placing.
+                    rows += extra
+                    loose = True
 
         out = []
         if rows:
@@ -413,6 +518,11 @@ class Corpus:
         took = (_dt.datetime.now() - t0).total_seconds() * 1000
         res = {"query": query, "beat": spec["beat"], "expanded": spec["expanded"],
                "terms": len(spec["terms"]), "scanned": len(rows),
+               # Whether the exact index found nothing and the prefix fallback
+               # answered instead. Worth surfacing: those results are looser by
+               # construction, and a reader deserves to know which pass they
+               # came from rather than wondering why the ranking changed.
+               "loose": loose,
                "total": len(out), "took_ms": round(took, 1),
                "results": out[:limit]}
         if record:
@@ -483,7 +593,7 @@ class Corpus:
     def _empty(query, spec):
         return {"query": query, "beat": spec["beat"], "expanded": spec["expanded"],
                 "terms": len(spec["terms"]), "scanned": 0, "total": 0,
-                "took_ms": 0.0, "results": []}
+                "loose": False, "took_ms": 0.0, "results": []}
 
     def stats(self) -> dict:
         agg = lambda col, field: [                                # noqa: E731
@@ -507,6 +617,62 @@ class Corpus:
 
 
 # -- helpers --------------------------------------------------------------
+
+# Only ASCII words are trimmed. Devanagari inflects by extending the stem
+# (गिरफ्तार -> गिरफ्तारी), which the prefix match already covers, and English
+# suffix rules mean nothing there.
+_LATIN = re.compile(r"^[A-Za-z][A-Za-z'-]*$")
+
+# What is left after trimming must still be long enough to be a word rather
+# than a fragment: "filed" would otherwise become "fil", which prefix-matches
+# "film" and "filter". Leaving such a word untrimmed costs nothing, because
+# the opposite query ("file") still reaches it by prefix.
+MIN_STEM = 4
+
+
+def _stem(word: str) -> str:
+    """
+    "cases" -> "case", "charges" -> "charg", "arrested" -> "arrest".
+
+    Crude on purpose, and it does not need to be better. The result is only
+    ever used as a regex PREFIX, so trimming a little too much widens the net
+    while trimming too little merely leaves the exact behaviour in place --
+    neither can return a wrong article, only more or fewer of them.
+
+    Both directions are covered by the pairing of trimming and prefixing:
+    "cases" is trimmed to "case" and finds "case", while "case" is left alone
+    and finds "cases" by prefix. That is what makes the singular and the
+    plural interchangeable, which is what a reader expects of a search box.
+    """
+    if not _LATIN.match(word):
+        return word.lower()
+    low = word.lower()
+    if low.endswith("ies") and len(low) > 4:
+        return low[:-3] + "y"
+    for suffix in ("ing", "es", "ed", "s"):
+        if low.endswith(suffix) and len(low) - len(suffix) >= MIN_STEM:
+            return low[:-len(suffix)]
+    return low
+
+
+def _residual_hits(row: dict, resid: list) -> int:
+    """How many of the reader's own extra words this article actually contains."""
+    hay = ("%s %s" % (row.get("headline") or "", row.get("body") or "")).lower()
+    return sum(1 for w in resid if w in hay)
+
+
+def _loose_clause(word: str) -> dict:
+    """
+    One word as a word-initial prefix match over `full_text`.
+
+    The left edge is anchored so a term cannot match from inside a longer
+    word -- "case" must not hit "staircase". The class is spelled out rather
+    than using \\b because Mongo's \\w is ASCII, and an explicit set is one
+    less thing to reason about on a bilingual corpus.
+    """
+    return {"full_text": {"$regex": r"(?<![A-Za-z0-9_])" + re.escape(_stem(word)),
+                          "$options": "i"}}
+
 
 def _clean(d):
     if not d:
@@ -532,6 +698,7 @@ def _stored_hit(r, blended, beat_id):
         "lexical": round(min(1.0, len(kws) / 8.0), 3),
         "beat_score": blended, "keywords": kws[:12],
         "off_patch": bool(sc.get(beat_id + "__off")),
+        "on_patch": bool(sc.get(beat_id + "__here")),
     }
 
 
@@ -548,6 +715,7 @@ def _hit(r, blended, lexs, s):
         "score": blended, "lexical": round(lexs, 3),
         "beat_score": s["score"], "keywords": s["hits"][:12],
         "off_patch": s["off_patch"],
+        "on_patch": bool(s.get("in_region")),
     }
 
 
@@ -663,6 +831,12 @@ def beats_for(article: dict) -> tuple:
         blended = round(W_LEX * lexs + W_BEAT * s["score"], 3)
         scores[beat_id] = blended
         scores[beat_id + "__off"] = False
+        # Whether the story names this force's own patch, kept alongside the
+        # score rather than folded into it. Search ranks on it as a TIER: a
+        # story naming Jharkhand belongs to Jharkhand Police more surely than
+        # a placeless story does, however much policing vocabulary the latter
+        # carries, and no weighting of the two on one scale expresses that.
+        scores[beat_id + "__here"] = bool(s["in_region"])
         # Which beat OWNS the article, for the `category` field. Previously the
         # first beat that matched, which was fine with one beat and arbitrary
         # with 36 -- every placeless police story would have been filed under

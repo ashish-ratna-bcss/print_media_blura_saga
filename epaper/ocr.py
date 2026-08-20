@@ -96,7 +96,50 @@ def langs_available() -> str:
     return "+".join(have) or "eng"
 
 
+# A paper's own language, as recorded in the web catalogue, to the Tesseract
+# languages worth offering it. Hindi papers keep English because Indian Hindi
+# broadsheets set names, acronyms and figures in Latin within the same
+# headline; English papers get English alone.
+_SCRIPTS = {"en": ["eng"], "hi": ["hin", "eng"]}
+
+
+def langs_for(lang: str | None = None) -> str:
+    """
+    Tesseract languages for one paper, rather than one setting for all of them.
+
+    Running `eng+hin` over an English broadsheet lets Tesseract pick Devanagari
+    for Latin type, and it does: a Tribune headline came back as
+    "ol cr for एम र नि". Nothing downstream can recover from that -- the words
+    are simply gone. Restricting the engine to the script the paper is actually
+    printed in removes the choice instead of trying to correct it afterwards.
+
+    An unknown or absent language falls back to the configured default, so
+    uploads and any caller that does not know the paper behave as before.
+    """
+    want = _SCRIPTS.get((lang or "").strip().lower())
+    if not want:
+        return langs_available()
+    st = available()
+    if not st["ok"]:
+        return "+".join(want)
+    have = [c for c in want if c in st["langs"]]
+    return "+".join(have) or langs_available()
+
+
 _JUNK = re.compile(r"[|_~^`]+")
+
+# A word longer than this has almost certainly lost a space. Measured on
+# Tribune p1: the fusions that actually occur are 9-12 characters
+# ("HChearing", "SCtellsSIT", "Twishacase", "Phuketflight"), so the original
+# 20 never fired on any of them. 15 clears ordinary long English words
+# ("investigation", "disproportionate" is 16 and would retry, which costs one
+# model call and is the cheap side of the trade).
+FUSED_LONG = 15
+
+# A lowercase letter followed immediately by a capital is the other signature
+# of a lost space, and it catches fusions far shorter than FUSED_LONG:
+# "SCtellsSIT", "probeSC", "MPjudge". Rare inside genuine headline words.
+_FUSED_CASE = re.compile(r"[a-z][A-Z]")
 
 
 def clean(text: str) -> str:
@@ -112,25 +155,30 @@ def clean(text: str) -> str:
     return t.strip(" -–—·.,")
 
 
-def read_headline(image, psm: int = 7) -> str:
+def read_headline(image, psm: int = 7, lang: str | None = None) -> str:
     """
     Recognise one already-cropped headline. Returns "" if OCR is unavailable.
 
     psm 7 = "treat the image as a single text line", which is what a headline
     box usually is. Falls back to psm 6 (a uniform block) when 7 yields
     nothing, because two- and three-line headlines are common.
+
+    `lang` is the paper's own language ("en", "hi"); see langs_for. Omitted, it
+    uses the configured default for every paper, which is what produced
+    Devanagari inside an English headline.
     """
     st = available()
     if not st["ok"]:
         return ""
     import pytesseract
+    langs = langs_for(lang)
     cfg = "--psm %d" % psm
     try:
-        txt = pytesseract.image_to_string(image, lang=langs_available(), config=cfg)
+        txt = pytesseract.image_to_string(image, lang=langs, config=cfg)
         out = clean(txt)
         if len(out) < 3 and psm == 7:
             out = clean(pytesseract.image_to_string(
-                image, lang=langs_available(), config="--psm 6"))
+                image, lang=langs, config="--psm 6"))
         return out
     except Exception:
         return ""
@@ -161,7 +209,9 @@ def looks_unreliable(text: str) -> bool:
     letters = sum(c.isalpha() for c in t)
     if letters < len(t) * 0.55:                 # digits/symbols dominate
         return True
-    if any(len(w) > 20 for w in words):         # spacing collapsed
+    if any(len(w) > FUSED_LONG for w in words):     # spacing collapsed
+        return True
+    if any(_FUSED_CASE.search(w) for w in words):   # "SCtellsSIT", "MPjudge"
         return True
     for w in words:                             # "Ap1t1", "Retestof3UGC"
         if re.search(r"[^\W\d_]\d|\d[^\W\d_]", w):

@@ -70,7 +70,13 @@ MIN_TEXT = 60
 # be fused, and only for terms long enough that a chance substring is unlikely.
 # Both limits matter: matching substrings across the whole text would let "cop"
 # hit inside "copy", and allowing short terms would do the same within a run.
-FUSED_RUN = 14        # a word this long is presumed to have lost its spaces
+# 14 was set before the fusions had been measured, and it was above every one
+# of them. Tribune p1 produced "HChearing" (9), "SCtellsSIT" (10),
+# "Twishacase" (10) and "Phuketflight" (12) -- all skipped, so the rescue this
+# constant exists for never ran on the damage it was written for. 9 covers the
+# observed range while staying above ordinary words a 5-char term could hide
+# inside ("courtesy" is 8, so "court" still cannot match there).
+FUSED_RUN = 9         # a word this long is presumed to have lost its spaces
 FUSED_TERM = 5        # shorter terms are too collision-prone to match loose
 
 # A CORE term in the headline is worth more than the same term buried in
@@ -100,6 +106,20 @@ OUT_OF_REGION = 0.35
 # a 0.5 threshold on lexical evidence alone. Hybrid mode is unaffected -- the
 # prefilter still hands them to the model, which may legitimately disagree.
 OUT_OF_REGION_CAP = 0.45
+
+# ...and the other half of the same idea, which was missing. Naming another
+# force's turf was penalised; naming your OWN was worth only the 0.3 the place
+# name carries as an ordinary CONTEXT term. So a story that says "Jharkhand"
+# and "Ranchi" ranked BELOW a placeless national story for the query
+# "jharkhand", purely because `SIT` is a heavier word than a district is --
+# measured on Tribune p1, 0.36 against 0.47.
+#
+# A story naming this force's own patch is strong evidence it is this force's
+# story, and it should be scored as such. Set below CORE deliberately: it is
+# corroboration, not the subject. Silence still costs nothing -- a Delhi
+# edition that never says "Delhi" is not penalised, which is the asymmetry
+# OUT_OF_REGION was written to protect.
+ON_PATCH_BONUS = 0.75
 
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _PUNCT = re.compile(r"[^\w\sऀ-ॿ]+", re.UNICODE)
@@ -383,6 +403,26 @@ def resolve(query: str):
     return best
 
 
+def _residual(query: str, beat: dict) -> list:
+    """
+    The words the reader typed that the beat name did not account for.
+
+    Resolution matches an alias ANYWHERE inside the query and then discards
+    the rest of it, so "police recruitment", "police case" and "police
+    corruption" all became the same search: the full force vocabulary, ranked
+    identically. Adding a word appeared to narrow the search and did nothing.
+
+    These leftovers are not used to SELECT -- the beat is still what decides
+    which articles are candidates, and requiring the extra word would throw
+    away the recall the vocabulary exists to provide. They are used to rank,
+    so a reader who typed "recruitment" sees recruitment stories first.
+    """
+    used = set()
+    for alias in beat.get("aliases") or []:
+        used.update(_norm(alias).split())
+    return [w for w in _norm(query).split() if len(w) > 2 and w not in used]
+
+
 def expand(query: str) -> dict:
     """
     A query to the vocabulary that will actually be searched for.
@@ -400,6 +440,7 @@ def expand(query: str) -> dict:
                 "patterns": pats,
                 "terms": [t for _, _, t in pats],
                 "fused": _fused_terms(pats, beat),
+                "residual": _residual(query, beat),
                 "region": here, "region_out": elsewhere}
     words = [w for w in _norm(query).split() if len(w) > 2]
     pats = [(CORE, _pattern(w, True)[0], w) for w in words]
@@ -407,6 +448,9 @@ def expand(query: str) -> dict:
             "topic": query.strip(), "expanded": False,
             "patterns": pats, "terms": words,
             "fused": [(w, CORE, w) for w in words if len(w) >= FUSED_TERM],
+            # Nothing was consumed by a beat name, so every word already
+            # counts through `patterns`; there is no leftover to rank on.
+            "residual": [],
             "region": [], "region_out": []}
 
 
@@ -463,6 +507,8 @@ def _finish(hits, total, in_headline, here, elsewhere, full) -> dict:
     off_patch = elsewhere and not here
     if off_patch:
         total = min(total * OUT_OF_REGION, FULL_SCORE * OUT_OF_REGION_CAP)
+    elif here:
+        total += ON_PATCH_BONUS
     return {"hits": hits, "weight": round(total, 2),
             "score": round(min(1.0, total / FULL_SCORE), 2),
             "headline_hit": in_headline, "in_region": here,

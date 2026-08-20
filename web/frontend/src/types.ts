@@ -69,11 +69,13 @@ export interface SearchHit {
   paper: string;
   edition: string;
   date: string;
-  page_no: number;
+  /** The API returns `page_number` here; `page_no` is the SQLite job schema. */
+  page_number: number;
   headline: string;
   body: string;
   byline: string;
   lang: string;
+  category: string;
   bbox: number[];
   crop: string | null;
   text_source: string;

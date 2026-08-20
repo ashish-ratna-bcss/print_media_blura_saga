@@ -60,8 +60,21 @@ STORY:
 %s
 
 Answer strictly about THIS story. Do not reward keyword overlap: a story that
-merely mentions the topic in passing is not about it. Reply in the story's own
-language for "summary", and in English for "why".
+merely mentions the topic in passing is not about it.
+
+Ground every word of your answer in the story text. Do not name the topic as
+an actor in "why" or "summary" unless the story itself says it acted: if the
+story says a government, a court or a commission did something, say that, not
+the topic.
+
+An indirect connection is still a connection. Where the link is real but
+sideways -- the place is right, or an investigation is demanded, or the subject
+borders the topic -- keep it, describe the link as it actually is, and give it
+a lower score. Lowering the score is how you express doubt. What you must never
+do is invent a link that the story does not contain in order to justify a high
+one.
+
+Reply in the story's own language for "summary", and in English for "why".
 
 Return ONLY JSON:
 {"relevant":<true|false>,"score":<0.0-1.0>,
