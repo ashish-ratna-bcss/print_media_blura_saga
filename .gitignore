@@ -10,6 +10,12 @@ web/server.log
 web/*.log
 *.log
 
+# Local configuration. Holds the MongoDB connection string, which for Atlas
+# means a username and password. Never commit this -- commit .env.example.
+.env
+.env.*
+!.env.example
+
 __pycache__/
 *.py[cod]
 .DS_Store

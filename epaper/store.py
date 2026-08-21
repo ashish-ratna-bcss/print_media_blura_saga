@@ -18,11 +18,25 @@ import datetime as _dt
 
 from pymongo import ASCENDING, MongoClient
 
+from . import config
+
 
 class Store:
-    def __init__(self, uri: str = "mongodb://localhost:27017", db: str = "epaper"):
-        self.client = MongoClient(uri, serverSelectionTimeoutMS=4000)
-        self.db = self.client[db]
+    """
+    Defaults come from epaper.config, the same source Corpus reads.
+
+    That matters more than it looks: Store and Corpus share the `pages` and
+    `articles` collections and hold different unique indexes on them. Letting
+    the two drift into different databases -- which is exactly what separate
+    hardcoded defaults invite -- would half-populate both and leave neither
+    correct.
+    """
+
+    def __init__(self, uri: str | None = None, db: str | None = None):
+        self.uri = config.mongo_uri(uri)
+        self.name = config.mongo_db(db)
+        self.client = MongoClient(self.uri, **config.mongo_kwargs())
+        self.db = self.client[self.name]
         self._ensure_indexes()
 
     def _ensure_indexes(self):

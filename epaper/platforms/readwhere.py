@@ -112,7 +112,15 @@ class Readwhere:
         return data if isinstance(data, dict) else {}
 
     def all_page_meta(self, issue_id, num_pages: int) -> dict:
-        """pagemeta only returns a couple of pages per call, so walk the range."""
+        """
+        pagemeta only returns a couple of pages per call, so walk the range.
+
+        May return far fewer pages than `num_pages`, and that is not an error:
+        on a gated title the server answers every range with page 1 instead of
+        refusing, so the walk collapses to a single entry. Callers must treat
+        the returned keys as the pages actually available and never assume
+        `1..num_pages`. Compare `len(out)` against `num_pages` to detect it.
+        """
         out = {}
         for start in range(1, num_pages + 1, 2):
             out.update(self.page_meta(issue_id, start, min(start + 1, num_pages)))

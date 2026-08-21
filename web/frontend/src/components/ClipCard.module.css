@@ -96,6 +96,29 @@
   margin: 0;
 }
 
+/* Matched beat terms. Not uppercased like .chip -- these are the words as they
+   appear in the story, including Devanagari, and casing is part of the evidence. */
+.terms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.term {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+.termMore {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 2px 6px;
+  color: var(--text-3);
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;

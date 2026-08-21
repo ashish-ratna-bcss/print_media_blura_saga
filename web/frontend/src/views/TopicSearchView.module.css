@@ -37,6 +37,280 @@
   background: var(--accent-soft);
 }
 
+/* -- beat presets ------------------------------------------------------- */
+
+.beatRow,
+.modeRow {
+  margin-top: 18px;
+}
+
+/* Two numbered steps, because the order is now load-bearing: the force chosen
+   in step 1 is what groups the newspaper and edition lists in step 2. */
+.stepLabel {
+  display: block;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted, #667);
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.searchFor {
+  margin-bottom: 22px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line, #e3e7ee);
+}
+
+.searchForRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: start;
+}
+
+.searchForRow > :first-child {
+  flex: 0 0 260px;
+  max-width: 260px;
+}
+
+.searchForRow > .topicField {
+  flex: 1 1 260px;
+  min-width: 220px;
+}
+
+.whereRow {
+  margin-bottom: 4px;
+}
+
+.coverage {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 14px;
+  padding: 11px 14px;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1.5;
+  border: 1px solid;
+}
+
+.coverage svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.coverageWarn {
+  color: #7c4a03;
+  background: #fdf5e6;
+  border-color: #e8c890;
+}
+
+.coverageBad {
+  color: #8a2432;
+  background: #fdeef0;
+  border-color: #edb3bc;
+}
+
+/* A missing newspaper is a gap in our catalogue, not a user error, so it is
+   informational rather than a warning. */
+.coverageInfo {
+  color: #1d4e79;
+  background: #edf4fb;
+  border-color: #b6d2ea;
+}
+
+/* Confirmation that the edition was set for you — the one case here that is
+   good news, so it reads green rather than as another thing to check. */
+.coverageOk {
+  color: #14603f;
+  background: #e8f6ef;
+  border-color: #a9dcc4;
+}
+
+.switchBtn {
+  flex: none;
+  margin-left: auto;
+  align-self: center;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+
+.switchBtn:hover {
+  opacity: 1;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverageWarn {
+    color: #e7bd7c;
+    background: #2a2013;
+    border-color: #5c451f;
+  }
+  .coverageBad {
+    color: #eda4b0;
+    background: #2c161a;
+    border-color: #5f2b34;
+  }
+  .coverageInfo {
+    color: #9dc6ea;
+    background: #142230;
+    border-color: #2b4661;
+  }
+  .coverageOk {
+    color: #86ceac;
+    background: #12241c;
+    border-color: #2c4d3c;
+  }
+}
+
+.beatList,
+.modeList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.beat {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 8px 13px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.beat:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.beatOn {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.beatCount {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+}
+
+/* -- expansion preview -------------------------------------------------- */
+
+.expansion {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-top: 9px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.expandIcon {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.expandPlain {
+  color: var(--text-3);
+}
+
+.linkBtn {
+  font-size: 12px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.termBox {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 10px;
+  padding: 11px;
+  max-height: 168px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.term {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-3);
+}
+
+/* -- engine ------------------------------------------------------------- */
+
+.mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 8px 13px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.mode:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mode:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.modeOn {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.modeHint {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.modeOn .modeHint {
+  color: var(--accent);
+  opacity: 0.75;
+}
+
 .actions {
   display: flex;
   align-items: center;

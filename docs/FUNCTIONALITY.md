@@ -183,8 +183,9 @@ thread" is stale.)
 
 ### Storage
 
-`web/data/jobs.db` — two tables: `jobs` (21 cols) and `articles` (16 cols). Schema
-upgrades in place via best-effort `ALTER TABLE ADD COLUMN` for the topic-search fields.
+`web/data/jobs.db` — two tables: `jobs` (25 cols) and `articles` (17 cols). Schema
+upgrades in place via best-effort `ALTER TABLE ADD COLUMN` for the topic-search fields
+(`jobs.mode`, `jobs.beat`, `jobs.note`, `jobs.prefiltered`, `articles.keywords`).
 Per-job files in `web/data/jobs/<jid>/`: `page.jpg`, `overlay.jpg`, `a01.jpg…`,
 `regions.json`.
 
@@ -196,9 +197,14 @@ Per-job files in `web/data/jobs/<jid>/`: `page.jpg`, `overlay.jpg`, `a01.jpg…`
 1. **New** — cascading Newspaper → Edition → Date → Page, *or* a drag-and-drop
    dropzone (`.jpg .jpeg .png .pdf`; PDFs go through `pdftoppm`, **first page only**).
    Both halves have an independent "Also read the text (much slower)" checkbox.
-2. **Topic search** — same selects plus a page count, a free-text topic, and 10 preset
-   chips (police/crime, courts, politics, civic, health, education, sports, business,
-   accidents, agriculture).
+2. **Topic search** — same selects plus a page count, a free-text topic, 9 preset
+   chips (courts, politics, civic, health, education, sports, business, accidents,
+   agriculture) and a **Beats** row of presets backed by a keyword vocabulary
+   (currently Delhi Police, 277 English/Hindi terms). Typing shows what the topic
+   expands to before the search runs, via `GET /api/expand`. An **Engine** toggle
+   picks `hybrid` (keywords then model — precise, minutes) or `keywords` (lexical
+   only, no relevance model call); the latter is offered only for a resolved beat,
+   since a free-text query has no vocabulary to match on.
 3. **Result** — five stat tiles, the annotated overlay with a colour legend, and a grid
    of clipping cards; click any crop for a lightbox.
 4. **History** — 11-column table of past jobs with status tags and per-row delete.

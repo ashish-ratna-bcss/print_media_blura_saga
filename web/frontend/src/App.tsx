@@ -1,4 +1,11 @@
-import { FileText, History as HistoryIcon, Loader2, Plus, Search } from "lucide-react";
+import {
+  Database,
+  FileText,
+  History as HistoryIcon,
+  Loader2,
+  Plus,
+  Search,
+} from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import styles from "./App.module.css";
 import { Header } from "./components/Header";
@@ -9,9 +16,14 @@ import type { JobKind } from "./types";
 import { HistoryView } from "./views/HistoryView";
 import { NewExtractionView } from "./views/NewExtractionView";
 import { ResultView } from "./views/ResultView";
+import { SearchView } from "./views/SearchView";
 import { TopicSearchView } from "./views/TopicSearchView";
 
-type TabId = "new" | "topic" | "result" | "history";
+// "archive" is the UI's name for what the backend calls the corpus. The
+// distinction is deliberate: /api/corpus, epaper/corpus.py and the
+// epaper_corpus database keep the technical term, while the tab says the
+// thing a reader would say.
+type TabId = "new" | "topic" | "archive" | "result" | "history";
 
 function TabPanel({ active, children }: { active: boolean; children: ReactNode }) {
   return (
@@ -47,6 +59,7 @@ export default function App() {
   const tabs: TabDef[] = [
     { id: "new", label: "New", icon: <Plus size={13} /> },
     { id: "topic", label: "Topic search", icon: <Search size={13} /> },
+    { id: "archive", label: "Archive", icon: <Database size={13} /> },
     {
       id: "result",
       label: "Result",
@@ -79,6 +92,10 @@ export default function App() {
           job={pendingKind === "topic" ? trackedJob : null}
           polling={pendingKind === "topic" && jobPoll.active}
         />
+      </TabPanel>
+
+      <TabPanel active={activeTab === "archive"}>
+        <SearchView active={activeTab === "archive"} />
       </TabPanel>
 
       <TabPanel active={activeTab === "result"}>

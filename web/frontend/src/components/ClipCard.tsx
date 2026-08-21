@@ -14,6 +14,17 @@ const cardVariants = {
   },
 };
 
+/** The keywords column is a JSON array; a malformed one must not blank the card. */
+function matchedTerms(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
 export function ClipCard({
   jobId,
   article,
@@ -26,6 +37,7 @@ export function ClipCard({
   const src = article.crop ? api.mediaUrl(jobId, article.crop) : null;
   const isAd = article.type === "ad";
   const bylineLine = [article.byline, article.dateline].filter(Boolean).join(" · ");
+  const terms = matchedTerms(article.keywords);
 
   return (
     <motion.article
@@ -65,6 +77,16 @@ export function ClipCard({
           </div>
         )}
         {article.topic_why && <p className={styles.why}>{article.topic_why}</p>}
+        {terms.length > 0 && (
+          <div className={styles.terms}>
+            {terms.slice(0, 8).map((t) => (
+              <span key={t} className={styles.term}>
+                {t}
+              </span>
+            ))}
+            {terms.length > 8 && <span className={styles.termMore}>+{terms.length - 8}</span>}
+          </div>
+        )}
         {(article.topic_summary || article.body) && (
           <div className={styles.txtWrap}>
             <p className={styles.txt}>

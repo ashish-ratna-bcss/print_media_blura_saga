@@ -375,7 +375,16 @@ You pick a newspaper and a topic, and get back only the stories about that topic
 The naive way would be to read every story properly and check each one. That is
 expensive — a front section can hold 60 stories.
 
-So we do it in two rounds, like sorting post:
+So we do it in three rounds, cheapest first, like sorting post:
+
+**Round zero — the word list.** Free, no AI at all. Asking for "Delhi Police" and
+hunting for the word *police* would miss most of the beat: the arrest, the FIR, the
+chargesheet, the DCP's statement. So the request is first matched to a **beat
+vocabulary** — a hand-written list of 277 things a Delhi police story actually says,
+in English and Hindi, each weighted by how much it proves on its own. A story that
+matches nothing at all from that list is not about the beat, and never troubles the
+AI. Hindi words are matched by their stem, so *थाना* also catches *थाने* and
+*गिरफ्तार* also catches *गिरफ्तारी*.
 
 **Round one — a quick skim.** We show the AI 25 story openings at once and ask only a
 rough question: "could this possibly be about police?" Not "is it definitely" — just
@@ -387,27 +396,34 @@ properly: is it really about this topic, how confident are we, and why.
 
 ```mermaid
 flowchart LR
-    A["60 stories<br/>in the edition"] --> B["ROUND 1 · quick skim<br/>25 shown at once<br/><b>2 calls total</b>"]
+    A["60 stories<br/>in the edition"] --> Z["ROUND 0 · word list<br/>277 terms, EN + HI<br/><b>0 calls · free</b>"]
+    Z --> B["ROUND 1 · quick skim<br/>25 shown at once<br/><b>2 calls total</b>"]
     B --> C["~8 possibles<br/><i>deliberately generous</i>"]
     C --> D["ROUND 2 · proper read<br/>one at a time<br/><b>8 calls</b>"]
     D --> E["3 real matches<br/>with reasons"]
 
     style A fill:#F4F4F2,stroke:#8A929E,color:#15181D
+    style Z fill:#F3EEF9,stroke:#6B4FA8,color:#15181D
     style B fill:#FBF2E9,stroke:#C9701C,color:#15181D
     style C fill:#F4F4F2,stroke:#8A929E,color:#15181D
     style D fill:#EDF4FB,stroke:#1B7FD4,color:#15181D
     style E fill:#ECF6F0,stroke:#1F7A4D,color:#15181D
 ```
 
-60 stories → 2 quick calls → maybe 8 survivors → 8 proper checks. **10 calls instead of
-60.**
+60 stories → a free word-list pass → 2 quick calls → maybe 8 survivors → 8 proper
+checks. **10 calls instead of 60**, and the terms each story matched are kept, so
+every result can show its own evidence.
 
-The generosity in round one is deliberate and worth understanding. A story thrown out in
-round one is gone for good — nobody looks at it again. A story wrongly *kept* just costs
-one extra check. So when in doubt, round one keeps it.
+The generosity is deliberate and worth understanding. A story thrown out early is gone
+for good — nobody looks at it again. A story wrongly *kept* just costs one extra check.
+So round zero only discards a story that had enough text to judge and matched nothing
+whatsoever, and if that would throw out the entire edition it keeps everything instead,
+on the grounds that the word list is likelier to be wrong than the newspaper.
 
 The instructions are explicit that just *mentioning* the topic is not enough. A story
-about a hospital that happens to quote a policeman is not a police story.
+about a hospital that happens to quote a policeman is not a police story. That
+judgement needs round two — which is why, when the AI server is unavailable and we fall
+back to the word list alone, the results say so.
 
 ---
 

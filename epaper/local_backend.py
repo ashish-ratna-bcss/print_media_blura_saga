@@ -42,7 +42,7 @@ import urllib.request
 
 from PIL import Image, ImageDraw
 
-from . import vlm
+from . import ocr, vlm
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -108,11 +108,29 @@ def _remote_elements(page_path: str, conf: float) -> list:
     return out["elements"]
 
 
+def _default_device() -> str:
+    """
+    Prefer the GPU, but fall back to CPU instead of raising.
+
+    This is not the kind of fallback the module refuses elsewhere. Downgrading
+    the *detector* changes the answer and is banned; downgrading the *device*
+    only changes how long the same answer takes. A CPU-only torch build is a
+    legitimate install -- DocLayout-YOLO is small enough to run on one, and on
+    a 4GB card it is arguably the better split, since it leaves the whole GPU
+    to the VLM. Force either way with EPAPER_DEVICE=cpu|cuda:0.
+    """
+    try:
+        import torch
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 def detect_elements(page_path: str, conf: float = 0.20, device: str = None) -> list:
     """Document elements with pixel boxes, numbered in reading order."""
     if LAYOUT_URL:
         return _remote_elements(page_path, conf)
-    device = device or os.environ.get("EPAPER_DEVICE", "cuda:0")
+    device = device or os.environ.get("EPAPER_DEVICE") or _default_device()
     try:
         res = _yolo().predict(page_path, imgsz=1024, conf=conf,
                               device=device, verbose=False)[0]
@@ -279,14 +297,47 @@ Return ONLY JSON:
 {"headline":"<text as printed>","is_ad":<true|false>}"""
 
 
-def _read_headline(page_path, box, pad=8):
-    """Read one headline. A small crop, so this is fast and hard to get wrong."""
+def _read_headline(page_path, box, pad=8, lang=None):
+    """
+    Read one headline.
+
+    This runs once per title candidate, and there are more of those than the
+    "a small crop, so this is fast" comment suggested: 18 on a Tribune front
+    page, ~19 s each through the vision model, which profiling put at 344 s of
+    a 475 s extraction -- 72% of the whole job.
+
+    So OCR reads it by default. The README's case against OCR is about raster
+    order over a whole page, which does not apply once YOLO has isolated a
+    single headline box; what is left is a strip of large bold type. Tesseract
+    does that in milliseconds on CPU.
+
+    The cost is the `is_ad` flag, which only the VLM prompt produced. Ad
+    detection falls back to the geometric figure-ratio test alone, which is
+    weaker. EPAPER_HEADLINE=vlm restores the old behaviour; =auto uses OCR and
+    retries with the VLM only when OCR returns nothing legible.
+    """
     from PIL import Image as _I
     with _I.open(page_path) as im:
         x0, y0, x1, y1 = box
         crop = im.convert("RGB").crop((max(0, x0 - pad), max(0, y0 - pad),
                                        min(im.width, x1 + pad),
                                        min(im.height, y1 + pad)))
+
+    # "ocr" by default. "auto" was tried and abandoned: only 3 of 18 crops
+    # triggered a fallback, but at 7-20 s each they ate the saving, leaving
+    # 1.8x instead of 16x. The deciding evidence was that the model garbles the
+    # same words -- it returned "Proud oftaggiven" and "PChidambaram" too --
+    # so paying for it buys differently-broken text, not correct text. The
+    # fused-run matching in keywords.py handles the damage instead, on both
+    # engines' output. "auto" and "vlm" remain available.
+    mode = os.environ.get("EPAPER_HEADLINE", "ocr").lower()
+    if mode in ("ocr", "auto"):
+        text = ocr.read_headline(crop, lang=lang)
+        if mode == "ocr":
+            return text, False
+        if text and not ocr.looks_unreliable(text):
+            return text, False
+
     try:
         d = vlm.chat_json(HEADLINE_PROMPT, crop, max_edge=900, max_tokens=300)
     except Exception:
@@ -322,7 +373,7 @@ def _figure_ratio(members, box):
     return fig / float(area)
 
 
-def group_articles(page_path: str, elements: list) -> list:
+def group_articles(page_path: str, elements: list, lang=None) -> list:
     """Title-anchored grouping: geometry proposes, the VLM reads each headline."""
     from PIL import Image as _I
     with _I.open(page_path) as im:
@@ -333,7 +384,7 @@ def group_articles(page_path: str, elements: list) -> list:
     texts = {}
     for e in elements:
         if e["kind"] in TITLE_KINDS:
-            texts[e["n"]] = _read_headline(page_path, e["bbox_px"])
+            texts[e["n"]] = _read_headline(page_path, e["bbox_px"], lang=lang)
     # Byline rejection is DISABLED. Removing byline-shaped titles from the
     # candidate pool shifts the median that sets the height floor, which
     # changes which real headlines survive as anchors. Measured on Statesman
@@ -368,6 +419,15 @@ def group_articles(page_path: str, elements: list) -> list:
             "headline_visible": headline,
             "continued_on_page": None,
             "package": False,
+            # Per-element boxes, kept rather than collapsed into the article
+            # bbox. The union box is enough to crop, but not enough to point a
+            # reader at the headline inside it, and this is the only place the
+            # member geometry still exists. `text` is filled for the headline
+            # only -- body text per region needs OCR, which does not run here.
+            "region_boxes": (
+                [{"type": "headline", "bbox": list(t["bbox_px"]), "text": headline}]
+                + [{"type": m["kind"], "bbox": list(m["bbox_px"]), "text": ""}
+                   for m in members]),
             "elements": sorted([t["n"]] + [m["n"] for m in members]),
             "element_kinds": kinds,
             "has_photo": any(m["kind"] == "figure" for m in members),
@@ -504,18 +564,71 @@ Transcribe what is printed. Keep the original script and language. Do not
 summarise, do not translate, do not invent text that is cut off at the edge.
 Use null for any field that is not present.
 
+The values below in <angle brackets> describe the TYPE of content expected.
+They are placeholders. Never copy them into your answer.
+
 Return ONLY JSON:
-{"headline":"...","subheadline":null,"kicker":null,"byline":null,
- "dateline":null,"location":null,
- "body":"full body text, paragraphs separated by blank lines",
+{"headline":"<headline exactly as printed>","subheadline":null,"kicker":null,
+ "byline":null,"dateline":null,"location":null,
+ "body":"<every paragraph of the body text, blank line between paragraphs>",
  "photo_captions":[],"continued_on_page":null,
  "category":"politics|crime|business|sports|civic|health|education|world|entertainment|other",
  "transcription_confidence":0.0}"""
 
 
+# What the model returns when it describes the field instead of filling it.
+# The prompt now says not to, and GROUP_PROMPT has carried that warning all
+# along, but a 7B model still does it occasionally and the result is worse
+# than an empty body: it is fluent English that gets indexed, searched and
+# shown to a reader as though it were the article. Observed once on a Jansatta
+# page, stored in MongoDB, and only caught by eye.
+_PLACEHOLDER_HINTS = (
+    "paragraphs separated by blank lines",
+    "blank line between paragraphs",
+    "every paragraph of the body",
+    "full body text",
+    "headline exactly as printed",
+    "headline text as printed",
+    "headline as printed",
+)
+
+# Long enough that a real article quoting one of these phrases survives, short
+# enough that a bare echo of the schema does not. A transcribed newspaper
+# article is hundreds of characters; a placeholder is a few dozen.
+_PLACEHOLDER_MAX = 120
+
+
+def _real(text, field: str) -> str:
+    """
+    Drop a value that describes the field instead of filling it.
+
+    Matched literally rather than by pattern, because the strings to catch are
+    known exactly: they are the ones written into READ_PROMPT above. A pattern
+    general enough to catch paraphrases would eventually eat a real sentence,
+    and silently deleting an article is worse than keeping one bad one.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    bare = t.strip("<>").strip()
+    low = bare.lower()
+    echoed = (t.startswith("<") and t.endswith(">")) or (
+        len(bare) <= _PLACEHOLDER_MAX
+        and any(h in low for h in _PLACEHOLDER_HINTS))
+    if echoed:
+        print("transcribe: model echoed the %s placeholder, discarding %r"
+              % (field, bare[:70]))
+        return ""
+    return t
+
+
 def transcribe(crop_path: str) -> dict:
     """Read one article crop into structured fields."""
-    return vlm.chat_json(READ_PROMPT, crop_path, max_edge=1280, max_tokens=3000)
+    out = vlm.chat_json(READ_PROMPT, crop_path, max_edge=1280, max_tokens=3000)
+    if isinstance(out, dict):
+        for field in ("headline", "body"):
+            out[field] = _real(out.get(field), field)
+    return out
 
 
 # -- inspection artefacts -------------------------------------------------
@@ -542,7 +655,7 @@ def debug_dir_for(paper, date, page_no) -> str:
 # -- orchestration --------------------------------------------------------
 
 def detect_regions(page_path: str, page_no: int = 1, paper: str = "", date: str = "",
-                   debug: bool = True) -> list:
+                   debug: bool = True, lang: str | None = None) -> list:
     """
     Drop-in replacement for segment.detect_regions / autosegment.detect_regions.
 
@@ -554,7 +667,7 @@ def detect_regions(page_path: str, page_no: int = 1, paper: str = "", date: str 
         raise LocalBackendError("DocLayout-YOLO found no elements on %s"
                                 % os.path.basename(page_path))
 
-    arts = group_articles(page_path, elements)
+    arts = group_articles(page_path, elements, lang=lang)
 
     with Image.open(page_path) as im:
         W, H = im.size
@@ -568,12 +681,16 @@ def detect_regions(page_path: str, page_no: int = 1, paper: str = "", date: str 
     if debug:
         dd = debug_dir_for(paper or "page", date or "", page_no)
         os.makedirs(dd, exist_ok=True)
-        json.dump({"page": page_path, "size": [W, H], "elements": elements},
-                  open(os.path.join(dd, "elements.json"), "w"),
-                  ensure_ascii=False, indent=1)
-        json.dump({"page": page_path, "articles": arts},
-                  open(os.path.join(dd, "grouping.json"), "w"),
-                  ensure_ascii=False, indent=1)
+        # encoding="utf-8" explicitly: open() would otherwise use the locale
+        # encoding, and cp1252 cannot represent the Devanagari these files are
+        # full of. Pairing that default with ensure_ascii=False raises rather
+        # than writing mojibake.
+        with open(os.path.join(dd, "elements.json"), "w", encoding="utf-8") as fh:
+            json.dump({"page": page_path, "size": [W, H], "elements": elements},
+                      fh, ensure_ascii=False, indent=1)
+        with open(os.path.join(dd, "grouping.json"), "w", encoding="utf-8") as fh:
+            json.dump({"page": page_path, "articles": arts},
+                      fh, ensure_ascii=False, indent=1)
         _annotate(page_path,
                   [e["bbox_px"] for e in elements],
                   [ELEMENT_COLORS.get(e["kind"], (120, 120, 130)) for e in elements],
