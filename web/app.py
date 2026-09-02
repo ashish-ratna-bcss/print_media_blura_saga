@@ -25,8 +25,8 @@ import datetime as dt
 import io
 import json
 import os
+import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -56,6 +56,13 @@ for _stream in (sys.stdout, sys.stderr):
 
 from epaper import config as epaper_config     # noqa: E402
 from epaper import beats as beats_mod          # noqa: E402
+from epaper import catdata                        # noqa: E402
+from epaper import categories as cat_mod          # noqa: E402
+from epaper import classify                       # noqa: E402
+from epaper import fragments                      # noqa: E402
+from epaper import jobs as jobstore                # noqa: E402
+from epaper import query as epaper_query           # noqa: E402
+from epaper import sources as src_mod             # noqa: E402
 from epaper import corpus as corpus_mod, keywords, local_backend, topics, vlm  # noqa: E402
 
 # Before anything reads os.environ. A `.env` at the repo root is how the
@@ -77,7 +84,15 @@ from epaper.segment import crop_region           # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 JOBS = os.path.join(DATA, "jobs")
-DB = os.path.join(DATA, "jobs.db")
+# The SQLite file job state used to live in. Kept as a constant only so
+# scripts/migrate_jobs.py has one place to find it; nothing here reads it any
+# more. Safe to delete once the History tab has been checked against MongoDB.
+LEGACY_DB = os.path.join(DATA, "jobs.db")
+
+# The Windows Task Scheduler entry that runs the nightly collection. Named
+# rather than generated so registering twice replaces the task instead of
+# leaving two of them fetching the same editions at the same time.
+SCHEDULED_TASK = "ClippingDeskDailyCollect"
 os.makedirs(JOBS, exist_ok=True)
 
 Image.MAX_IMAGE_PIXELS = None
@@ -85,7 +100,13 @@ Image.MAX_IMAGE_PIXELS = None
 
 @contextlib.asynccontextmanager
 async def lifespan(_app):
-    """Install the stored beat vocabulary before the first request."""
+    """Open the job store, then install the stored beat vocabulary."""
+    # init_db() used to run only from main(), which meant it happened when the
+    # app was LAUNCHED and never when it was IMPORTED. The nightly runner
+    # imports it -- scripts/daily.py drives run_ingest_job directly -- so it
+    # started against a store it had never opened. Found by running a real
+    # edition; no unit test would have, because they never touch the database.
+    init_db()
     _load_beats()
     yield
 
@@ -148,52 +169,47 @@ _cache = {}
 
 # ---------------------------------------------------------------- storage
 
-def db():
-    c = sqlite3.connect(DB, timeout=30)
-    c.row_factory = sqlite3.Row
-    return c
-
-
 def init_db():
-    with db() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS jobs(
-            id TEXT PRIMARY KEY, created TEXT, source TEXT, paper TEXT,
-            edition TEXT, date TEXT, page_no INTEGER, status TEXT, stage TEXT,
-            error TEXT, n_articles INTEGER DEFAULT 0, n_ads INTEGER DEFAULT 0,
-            coverage REAL DEFAULT 0, width INTEGER, height INTEGER,
-            with_text INTEGER DEFAULT 0, elapsed REAL DEFAULT 0,
-            kind TEXT DEFAULT 'page', topic TEXT, searched INTEGER DEFAULT 0,
-            screened INTEGER DEFAULT 0, mode TEXT, beat TEXT, note TEXT,
-            prefiltered INTEGER DEFAULT 0)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS articles(
-            job_id TEXT, seq INTEGER, type TEXT, headline TEXT, body TEXT,
-            byline TEXT, dateline TEXT, category TEXT, bbox TEXT,
-            crop TEXT, n_elements INTEGER, has_photo INTEGER,
-            topic_score REAL, topic_why TEXT, topic_summary TEXT,
-            page_ref INTEGER, keywords TEXT)""")
-        # tolerate databases created before topic search / keyword search existed
-        for tbl, col, typ in (("jobs", "kind", "TEXT"), ("jobs", "topic", "TEXT"),
-                              ("jobs", "searched", "INTEGER"), ("jobs", "screened", "INTEGER"),
-                              ("jobs", "mode", "TEXT"), ("jobs", "beat", "TEXT"),
-                              ("jobs", "note", "TEXT"),
-                              ("jobs", "prefiltered", "INTEGER"),
-                              ("articles", "topic_score", "REAL"),
-                              ("articles", "topic_why", "TEXT"),
-                              ("articles", "topic_summary", "TEXT"),
-                              ("articles", "page_ref", "INTEGER"),
-                              ("articles", "keywords", "TEXT")):
-            try:
-                c.execute("ALTER TABLE %s ADD COLUMN %s %s" % (tbl, col, typ))
-            except sqlite3.OperationalError:
-                pass
+    """
+    Prepare the job store.
+
+    Was a SQLite schema migration -- CREATE TABLE plus an ALTER for every
+    column added since -- and is now index creation, because MongoDB has no
+    schema to migrate. Adding a field to a job is writing it; the defaults in
+    epaper/jobs.py are what keep older documents answering with a 0 where the
+    frontend expects one rather than an undefined.
+
+    Still called on startup, and still tolerant: a database that is down is
+    reported by the first request that needs it, with the reason, rather than
+    preventing the process from starting at all.
+    """
+    if not jobstore.store():
+        print("job store unavailable at startup: %s" % jobstore.last_error())
+
+
+def jobs_store():
+    """
+    The job store, or a 503 naming the reason.
+
+    Job state lives in MongoDB with the corpus (see epaper/jobs.py), which
+    makes the database a hard requirement rather than the optional index it
+    was: without it there is nowhere to record that a run started, so the
+    honest thing is to refuse the request rather than begin work whose result
+    cannot be kept.
+    """
+    s = jobstore.store()
+    if not s:
+        raise HTTPException(503, "job store unavailable: %s"
+                            % (jobstore.last_error() or "mongodb down"))
+    return s
 
 
 def set_job(jid, **kw):
     if not kw:
         return
-    with _lock, db() as c:
-        c.execute("UPDATE jobs SET %s WHERE id=?" % ",".join("%s=?" % k for k in kw),
-                  list(kw.values()) + [jid])
+    s = jobstore.store()
+    if s:
+        s.set(jid, **kw)
 
 
 def job_dir(jid):
@@ -287,8 +303,11 @@ def fetch_page(host, title_id, date, page_no, dest):
     Readwhere needs a tile pyramid stitched; Hindustan serves the whole page as
     one file, at higher resolution than the stitched result.
     """
-    if platform_of(host) == "livehindustan":
+    plat = platform_of(host)
+    if plat == "livehindustan":
         return fetch_page_lh(host, title_id, date, page_no, dest)
+    if plat == "summit":
+        return fetch_page_summit(host, title_id, date, page_no, dest)
     rw = Readwhere(host)
     issue = rw.issue_for_date(title_id, date)
     if not issue:
@@ -321,6 +340,39 @@ def fetch_page(host, title_id, date, page_no, dest):
     if not stitch_tiles(rw.tiles(level), level["width"], level["height"], dest):
         raise RuntimeError("page tiles could not be assembled")
     return {"issue_id": issue, "num_pages": n, "title_name": cfg.get("titleName", "")}
+
+
+def fetch_page_summit(host, edition_id, date, page_no, dest):
+    """
+    One Summit page as an image.
+
+    Summit serves whole page renders rather than a tile pyramid, and -- unlike
+    Readwhere, which returns page 1 for anything gated -- it serves every page
+    of the edition. Measured on Sakshi: six requested, six distinct images of
+    about 2.4 MB each. So a Telugu title collects a complete newspaper where a
+    Tribune edition collects a front page.
+
+    Shares the resolution rule with summit_pages_to_disk: "HighResolution" is
+    a misnomer for the ~900px render, at which body text is unreadable to any
+    OCR, so the XX variant is taken first.
+    """
+    pages = Summit(host).pages(
+        edition_id, "%s/%s/%s" % (date[8:10], date[5:7], date[0:4]))
+    if not pages:
+        raise RuntimeError("no issue published for %s on %s" % (edition_id, date))
+
+    want = int(page_no)
+    pg = next((p for p in pages if int(p.get("PageNo") or 0) == want), None)
+    if pg is None:
+        raise RuntimeError("page %d not in this edition (%d pages)"
+                           % (want, len(pages)))
+    url = (pg.get("XXHighResolution") or pg.get("XHighResolution")
+           or pg.get("HighResolution") or pg.get("LowResolution"))
+    if not url:
+        raise RuntimeError("page %d carries no image url" % want)
+    if not acq_download(url, dest):
+        raise RuntimeError("page %d could not be downloaded" % want)
+    return dest
 
 
 def fetch_page_lh(host, city, date, page_no, dest):
@@ -432,22 +484,51 @@ def run_job(jid, spec):
                     a.update({"body": f.get("body") or "",
                               "byline": f.get("byline") or "",
                               "dateline": f.get("dateline") or "",
-                              "category": f.get("category") or "",
                               "headline": f.get("headline") or a["headline"]})
                 except Exception as ex:
                     a["body"] = "[read failed: %s]" % str(ex)[:120]
 
-        with _lock, db() as c:
-            c.execute("DELETE FROM articles WHERE job_id=?", (jid,))
-            for a in arts:
-                c.execute("""INSERT INTO articles(job_id,seq,type,headline,body,
-                    byline,dateline,category,bbox,crop,n_elements,has_photo)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                          (jid, a["seq"], a["type"], a["headline"],
-                           a.get("body", ""), a.get("byline", ""),
-                           a.get("dateline", ""), a.get("category", ""),
-                           json.dumps(a["bbox"]), a["crop"], a["n_elements"],
-                           int(a["has_photo"])))
+            # Datelines, bylines and OCR noise look like articles all the way
+            # to here -- they have a box and some text. Marking them now, once
+            # the text exists to judge, keeps them out of the classifier queue
+            # as well as out of the corpus; they stay in `arts` and on the
+            # annotated page, so nothing is hidden by the decision.
+            _, furniture = fragments.split(
+                [a for a in arts if a["type"] == "article"])
+            if furniture:
+                print("%s: %d blocks marked as page furniture (%s)"
+                      % (jid, len(furniture),
+                         ", ".join(sorted({f["fragment_reason"]
+                                           for f in furniture}))))
+
+            # Topic labelling, once the text exists to label. Batched, so a
+            # page of 20 stories costs two calls rather than twenty, and
+            # non-fatal: a failure here leaves the articles unlabelled but
+            # still extracted, transcribed and stored.
+            todo = [a for a in arts if a["type"] == "article"]
+            if todo:
+                set_job(jid, stage="labelling %d articles" % len(todo))
+                try:
+                    for a, r in zip(todo, classify.classify(
+                            todo, progress=lambda n, t: set_job(
+                                jid, stage="labelling %d/%d" % (n, t)))):
+                        a.update({"category": r["category"],
+                                  "raw_category": r["raw_category"],
+                                  "tags": r["tags"]})
+                except Exception as ex:
+                    print("classify failed for job %s: %s" % (jid, ex))
+
+        # A single page run owns the job's rows outright, so they are replaced
+        # rather than appended to -- a re-run of one page should not leave the
+        # previous attempt's rows behind it.
+        jobs_store().reset_rows(jid, [
+            {"type": a["type"], "headline": a["headline"],
+             "body": a.get("body", ""), "byline": a.get("byline", ""),
+             "dateline": a.get("dateline", ""),
+             "category": a.get("category", ""),
+             "bbox": json.dumps(a["bbox"]), "crop": a["crop"],
+             "n_elements": a["n_elements"],
+             "has_photo": int(a["has_photo"])} for a in arts])
         # encoding="utf-8" is not optional here, and its absence was fatal.
         # Python's open() defaults to the locale encoding, which on Windows is
         # cp1252 -- so `ensure_ascii=False`, added precisely so Devanagari
@@ -467,6 +548,189 @@ def run_job(jid, spec):
                 n_articles=sum(1 for a in arts if a["type"] == "article"),
                 n_ads=sum(1 for a in arts if a["type"] == "ad"),
                 coverage=float(regions[0].get("coverage", 0) if regions else 0),
+                elapsed=(dt.datetime.now() - t0).total_seconds())
+    except Exception as ex:
+        traceback.print_exc()
+        set_job(jid, status="error", stage="failed", error=str(ex)[:400],
+                elapsed=(dt.datetime.now() - t0).total_seconds())
+
+
+# --------------------------------------------------------- edition ingest
+
+def ingest_one_page(jid, d, spec, pno, n_pages):
+    """
+    One page of an edition, all the way to the corpus. Returns article count.
+
+    The same sequence run_job performs for a single page, with the reporting
+    written for a job that will do this twenty more times. Kept separate from
+    run_job rather than folded into it: run_job answers "show me this page",
+    keeps its overlay and its crops for inspection, and belongs to a person
+    waiting. This belongs to a schedule, at 2am, with nobody watching.
+    """
+    label = "page %d/%d" % (pno, n_pages)
+    page = os.path.join(d, "p%02d.jpg" % pno)
+
+    set_job(jid, stage="%s: fetching" % label)
+    fetch_page(spec["host"], spec["title_id"], spec["date"], pno, page)
+    with Image.open(page) as im:
+        W, H = im.size
+
+    set_job(jid, stage="%s: layout" % label)
+    regions = local_backend.detect_regions(
+        page, pno, paper=spec.get("paper", ""), date=spec.get("date", ""),
+        debug=False, lang=lang_of(spec.get("host")))
+
+    arts = []
+    for r in regions:
+        if r.get("type") != "article":
+            continue
+        seq = len(arts) + 1
+        crop = "p%02d_a%02d.jpg" % (pno, seq)
+        try:
+            crop_region(page, r["bbox_px"], os.path.join(d, crop))
+        except Exception:
+            continue
+        arts.append({"seq": seq, "type": "article",
+                     "headline": r.get("headline_visible", ""),
+                     "bbox": r["bbox_px"], "crop": crop, "page_ref": pno,
+                     "n_elements": len(r.get("elements") or []),
+                     "has_photo": bool(r.get("has_photo")),
+                     "text_source": "vlm"})
+    if not arts:
+        return 0
+
+    for n, a in enumerate(arts, 1):
+        set_job(jid, stage="%s: reading %d/%d" % (label, n, len(arts)))
+        try:
+            f = local_backend.transcribe(os.path.join(d, a["crop"]))
+            a.update({"body": f.get("body") or "",
+                      "byline": f.get("byline") or "",
+                      "dateline": f.get("dateline") or "",
+                      "headline": f.get("headline") or a["headline"]})
+        except Exception as ex:
+            a["body"] = "[read failed: %s]" % str(ex)[:120]
+
+    # See run_job: page furniture is marked before labelling, not after, so a
+    # dateline never costs a classifier call or reaches the corpus.
+    stories, furniture = fragments.split(arts)
+    if furniture:
+        print("%s %s: %d blocks marked as page furniture"
+              % (jid, label, len(furniture)))
+
+    set_job(jid, stage="%s: labelling %d articles" % (label, len(stories)))
+    try:
+        for a, r in zip(stories, classify.classify(stories)):
+            a.update({"category": r["category"],
+                      "raw_category": r["raw_category"], "tags": r["tags"]})
+    except Exception as ex:
+        # Unlabelled is recoverable -- /api/corpus/reclassify fills it in
+        # later without re-reading the page. Losing the transcription is not,
+        # so a labelling failure must never abandon the page.
+        print("classify failed on %s of %s: %s" % (label, jid, ex))
+
+    # The job's own rows, so the Result tab can show what this run produced.
+    # Without this an edition job filed everything into MongoDB correctly and
+    # then displayed an empty Result screen, because that view reads SQLite --
+    # the work was done and looked like it had not been.
+    #
+    # Appended rather than replacing, since a page job clears its rows first
+    # and an edition writes one page at a time; deleting here would leave only
+    # the last page of a twenty-page edition.
+    jobs_store().add_rows(jid, [
+        {"type": a["type"], "headline": a.get("headline", ""),
+         "body": a.get("body", ""), "byline": a.get("byline", ""),
+         "dateline": a.get("dateline", ""), "category": a.get("category", ""),
+         "bbox": json.dumps(a.get("bbox") or []), "crop": a.get("crop"),
+         "n_elements": a.get("n_elements", 0),
+         "has_photo": int(bool(a.get("has_photo")))} for a in arts],
+        page_ref=pno)
+
+    ingest_quietly(arts, job_id=jid, paper=spec.get("paper", ""),
+                   edition=spec.get("edition", ""), date=spec.get("date", ""),
+                   default_page=pno,
+                   page_images={pno: {"path": page, "width": W, "height": H}})
+    # Stories, not blocks. The job's n_articles is what the Result and History
+    # screens report, and counting furniture there is what made a nine-story
+    # front page claim twenty-three articles.
+    return len(stories)
+
+
+def run_ingest_job(jid, spec):
+    """
+    Every page of one edition: fetch, segment, read, label, file.
+
+    Two properties matter more than speed here, because this runs unattended.
+
+    RESUMABLE   A page already in the corpus is skipped. Reading a page costs
+                about a minute of GPU time, so a run that died at page 19 must
+                not start again at page 1, and a schedule that fires twice
+                must not pay for the same edition twice.
+
+    PARTIAL     One page failing does not fail the edition. A torn scan, a
+                404, a model timeout on one crop -- each costs that page and
+                nothing else. Twenty-three good pages are worth having, and
+                the failures are counted so nobody has to read a log to find
+                out the run was incomplete.
+    """
+    t0 = dt.datetime.now()
+    d = job_dir(jid)
+    try:
+        set_job(jid, status="running", stage="resolving edition")
+        total_pages = issue_page_count(spec["host"], spec["title_id"],
+                                       spec["date"])
+        if not total_pages:
+            raise RuntimeError("edition reports no pages")
+
+        # Three ways to say which pages, in order of specificity. A range is
+        # what somebody asking for "the city pages" means; max_pages is the
+        # older "first N" and still what the nightly round uses; neither means
+        # the whole edition.
+        first = max(1, int(spec.get("from_page") or 1))
+        last = int(spec.get("to_page") or 0) or total_pages
+        last = min(last, total_pages)
+        if spec.get("max_pages"):
+            last = min(last, first + int(spec["max_pages"]) - 1)
+        if first > last:
+            raise RuntimeError(
+                "page %d is past the end of a %d-page edition"
+                % (first, total_pages))
+
+        n_pages = last - first + 1
+        set_job(jid, n_pages=n_pages, pages_done=0, pages_failed=0,
+                pages_skipped=0)
+
+        c = corpus()
+        done = failed = skipped = articles = 0
+        errors = []
+        for pno in range(first, last + 1):
+            if c and not spec.get("force") and \
+                    c.has_page(spec.get("paper", ""), spec.get("date", ""), pno):
+                skipped += 1
+                set_job(jid, pages_skipped=skipped,
+                        stage="page %d of %d-%d: already held" % (pno, first, last))
+                continue
+            try:
+                articles += ingest_one_page(jid, d, spec, pno, n_pages)
+                done += 1
+            except Exception as ex:
+                failed += 1
+                errors.append("p%d: %s" % (pno, str(ex)[:90]))
+                print("edition %s page %d failed: %s" % (jid, pno, ex))
+            set_job(jid, pages_done=done, pages_failed=failed,
+                    n_articles=articles)
+
+        # A run where every page failed is a failure, however many pages it
+        # politely skipped past. Reporting it as "done" is how a broken
+        # overnight schedule goes unnoticed for a week.
+        if failed and not done and not skipped:
+            raise RuntimeError("every page failed: %s" % "; ".join(errors[:3]))
+
+        note = ""
+        if failed:
+            note = "%d of %d pages failed: %s" % (
+                failed, n_pages, "; ".join(errors[:3]))
+        set_job(jid, status="done", stage="complete", error="", note=note,
+                n_articles=articles,
                 elapsed=(dt.datetime.now() - t0).total_seconds())
     except Exception as ex:
         traceback.print_exc()
@@ -541,13 +805,28 @@ def issue_page_count(host, title_id, date) -> int:
     which was doubly misleading: the issue existed, and the message named the
     date rather than the real cause.
     """
-    if platform_of(host) == "livehindustan":
+    plat = platform_of(host)
+    if plat == "livehindustan":
         ed = LiveHindustan(host).edition(title_id, date)
         if not ed["pages"]:
             raise RuntimeError(
                 "%s has no pages for %s -- that edition has not been "
                 "published yet" % (ed.get("name") or title_id, date or "today"))
         return ed["total_pages"]
+    if plat == "summit":
+        # The same bug the docstring above describes, repeated. Summit titles
+        # fell through to the Readwhere branch, which asks an API that knows
+        # nothing about them and truthfully answers "no issue" -- so Sakshi
+        # reported no edition published on eight consecutive days while
+        # publishing normally, and the Daily Reader showed it as waiting.
+        #
+        # Summit dates its issues dd/mm/yyyy, which is why this cannot simply
+        # share the Readwhere path.
+        sm = Summit(host)
+        pages = sm.pages(title_id, "%s/%s/%s" % (date[8:10], date[5:7], date[0:4]))
+        if not pages:
+            raise RuntimeError("no issue published on %s" % date)
+        return len(pages)
     rw = Readwhere(host)
     issue = rw.issue_for_date(title_id, date)
     if not issue:
@@ -644,11 +923,74 @@ def resolve_mode(requested, kw):
     return "hybrid", ""
 
 
+def run_archive_job(jid, spec):
+    """
+    The same question, asked of what has already been read.
+
+    A topic job normally fetches pages and reads them, which costs minutes per
+    page and can only ever answer about one date. Everything already extracted
+    is sitting in the corpus with its keywords and beat scores precomputed, so
+    the same question over that costs milliseconds and can span a month.
+
+    Runs inline rather than as a background task: there is nothing to wait for,
+    and a progress panel that appears and vanishes reads as a glitch.
+    """
+    t0 = dt.datetime.now()
+    c = corpus()
+    if not c:
+        set_job(jid, status="error", stage="failed",
+                error="corpus unavailable: %s" % (_corpus_err or "mongodb down"))
+        return
+
+    date_from, date_to = epaper_query.resolve_timeframe(
+        spec.get("timeframe") or "today",
+        date_from=spec.get("date_from") or spec.get("date"),
+        date_to=spec.get("date_to") or spec.get("date"))
+    days = epaper_query.parse_weekdays(spec.get("weekdays"))
+
+    set_job(jid, status="running", stage="searching the archive")
+    res = c.search(
+        spec["topic"], paper=spec.get("paper") or None,
+        date_from=date_from, date_to=date_to,
+        category=spec.get("category") or None,
+        exclude=spec.get("exclude"), proximity=spec.get("proximity"),
+        weekdays=days, limit=200,
+        min_score=float(spec.get("min_score") or 0.0))
+
+    rows = [{"type": "article", "headline": r.get("headline", ""),
+             "body": r.get("body", ""), "byline": r.get("byline", ""),
+             "dateline": r.get("dateline", ""),
+             "category": r.get("category", ""),
+             "bbox": json.dumps(r.get("bbox") or []), "crop": r.get("crop"),
+             "n_elements": 0, "has_photo": 0,
+             "topic_score": r.get("score"),
+             "topic_why": r.get("why") or "",
+             "topic_summary": "",
+             "page_ref": r.get("page_number") or 0,
+             "keywords": json.dumps(r.get("hits") or [], ensure_ascii=False)}
+            for r in res["results"]]
+    jobs_store().reset_rows(jid, rows)
+
+    span = ("%s to %s" % (date_from, date_to)) if date_from and date_to \
+        else "the whole archive"
+    set_job(jid, status="done", stage="complete", error="",
+            n_articles=len(rows), searched=res.get("scanned") or 0,
+            screened=len(rows), prefiltered=0,
+            beat=res.get("beat") or "", mode="archive",
+            elapsed=(dt.datetime.now() - t0).total_seconds(),
+            note="searched %s in %.0f ms; no pages fetched"
+                 % (span, res.get("took_ms") or 0))
+
+
 def run_topic_job(jid, spec):
     t0 = dt.datetime.now()
     d = job_dir(jid)
     topic = spec["topic"]
     try:
+        # Nothing to fetch, nothing to read: answer from the corpus and stop.
+        if spec.get("scope") == "archive":
+            run_archive_job(jid, spec)
+            return
         set_job(jid, status="running", stage="collecting articles")
         arts = []
         if spec["platform"] == "summit":
@@ -750,21 +1092,48 @@ def run_topic_job(jid, spec):
                     matches.append(a)
             matches.sort(key=lambda m: -m["topic_score"])
 
-        with _lock, db() as c:
-            c.execute("DELETE FROM articles WHERE job_id=?", (jid,))
-            for k, a in enumerate(matches, 1):
-                c.execute("""INSERT INTO articles(job_id,seq,type,headline,body,
-                    byline,dateline,category,bbox,crop,n_elements,has_photo,
-                    topic_score,topic_why,topic_summary,page_ref,keywords)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                          (jid, k, "article", a.get("headline", ""),
-                           a.get("body", ""), a.get("byline", ""),
-                           a.get("dateline", ""), kw["label"] if kw["beat"] else "",
-                           json.dumps(a.get("bbox") or []), a.get("crop"),
-                           a.get("n_elements", 0), int(bool(a.get("has_photo"))),
-                           a.get("topic_score"), a.get("topic_why"),
-                           a.get("topic_summary"), a.get("page_ref"),
-                           json.dumps(a.get("keywords") or [], ensure_ascii=False)))
+        # The same refinements the archive path pushes into MongoDB, applied
+        # here in Python. One definition in epaper/query.py, two callers, so
+        # "exclude traffic" cannot come to mean different things depending on
+        # whether the articles were fetched or recalled.
+        #
+        # Applied last, after screening and assessment, rather than as an early
+        # filter. It costs a little more model time, but `enriched` keeps the
+        # bodies that were read -- so an article excluded from THIS answer is
+        # still transcribed and still reaches the corpus, where a query without
+        # the exclusion will find it.
+        drop = epaper_query.parse_terms(spec.get("exclude"))
+        window = epaper_query.window_for(spec.get("proximity"))
+        if drop or window is not None:
+            before = len(matches)
+            kept = []
+            for m in matches:
+                text = "%s %s" % (m.get("headline") or "", m.get("body") or "")
+                hit = epaper_query.excluded_by(text, drop)
+                if hit:
+                    continue
+                if not epaper_query.within(text, topic, window):
+                    continue
+                kept.append(m)
+            matches = kept
+            if before != len(matches):
+                print("%s: %d of %d ruled out by exclude/proximity"
+                      % (jid, before - len(matches), before))
+
+        jobs_store().reset_rows(jid, [
+            {"type": "article", "headline": a.get("headline", ""),
+             "body": a.get("body", ""), "byline": a.get("byline", ""),
+             "dateline": a.get("dateline", ""),
+             "category": kw["label"] if kw["beat"] else "",
+             "bbox": json.dumps(a.get("bbox") or []), "crop": a.get("crop"),
+             "n_elements": a.get("n_elements", 0),
+             "has_photo": int(bool(a.get("has_photo"))),
+             "topic_score": a.get("topic_score"),
+             "topic_why": a.get("topic_why"),
+             "topic_summary": a.get("topic_summary"),
+             "page_ref": a.get("page_ref"),
+             "keywords": json.dumps(a.get("keywords") or [],
+                                    ensure_ascii=False)} for a in matches])
 
         # Index everything collected, preferring the transcribed version where
         # one exists. Done in one pass: ingesting arts and matches separately
@@ -1023,12 +1392,11 @@ def dates(host: str, title_id: str):
 
 def _create(spec, paper, edition, date, page_no, with_text):
     jid = uuid.uuid4().hex[:12]
-    with _lock, db() as c:
-        c.execute("""INSERT INTO jobs(id,created,source,paper,edition,date,
-            page_no,status,stage,with_text) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                  (jid, dt.datetime.now().isoformat(timespec="seconds"),
-                   spec["source"], paper, edition, date, page_no,
-                   "queued", "queued", int(bool(with_text))))
+    jobs_store().create(
+        jid, created=dt.datetime.now().isoformat(timespec="seconds"),
+        source=spec["source"], paper=paper, edition=edition, date=date,
+        page_no=page_no, status="queued", stage="queued",
+        with_text=int(bool(with_text)))
     return jid
 
 
@@ -1063,56 +1431,784 @@ def fetch(background: BackgroundTasks, payload: dict):
     return {"job_id": jid}
 
 
-@app.post("/api/jobs/topic")
-def topic_job(background: BackgroundTasks, payload: dict):
-    for k in ("host", "title_id", "date", "topic"):
+@app.post("/api/jobs/ingest")
+def ingest_edition(background: BackgroundTasks, payload: dict):
+    """
+    Collect a whole edition: every page, read, labelled and filed.
+
+    The overnight path. Long-running by nature -- roughly a minute of GPU time
+    per page -- so it returns a job id immediately and reports progress through
+    /api/jobs/{id}. Re-running it for a date already collected is cheap and
+    safe: held pages are skipped unless `force` is set.
+    """
+    for k in ("host", "title_id", "date"):
         if not payload.get(k):
             raise HTTPException(400, "missing %s" % k)
-    host = payload["host"]
+    paper = payload.get("paper") or next(
+        (p["name"] for p in CATALOGUE if p["host"] == payload["host"]),
+        payload["host"])
+    jid = _create({"source": "ingest"}, paper, payload.get("edition", ""),
+                  payload["date"], 0, True)
+    set_job(jid, kind="edition")
+    background.add_task(run_ingest_job, jid, {
+        "source": "ingest", "host": payload["host"],
+        "title_id": payload["title_id"], "date": payload["date"],
+        "paper": paper, "edition": payload.get("edition", ""),
+        "max_pages": int(payload.get("max_pages") or 0),
+        "from_page": int(payload.get("from_page") or 0),
+        "to_page": int(payload.get("to_page") or 0),
+        "force": bool(payload.get("force")),
+    })
+    return {"job_id": jid}
+
+
+# ----------------------------------------------------------------- sources
+
+def source_store():
+    s = src_mod.store()
+    if not s:
+        raise HTTPException(503, "sources unavailable: %s" % src_mod.last_error())
+    return s
+
+
+@app.get("/api/daily")
+def daily_reader(date: str = None):
+    """
+    One day's collection: what was asked for, what arrived, what is missing.
+
+    Deliberately answers about the READER'S day rather than about jobs. The
+    History tab already lists runs; this lists papers, and a paper that was
+    due and produced nothing has to appear here as an absence -- a Daily
+    Reader that only lists what succeeded cannot tell "Sakshi published
+    nothing" from "Sakshi was never registered".
+    """
+    day = date or dt.date.today().isoformat()
+    c = corpus()
+    if not c:
+        raise HTTPException(503, "corpus unavailable: %s"
+                            % (_corpus_err or "mongodb down"))
+
+    collected = {(r["paper"], r["edition"]): r for r in c.by_paper(day)}
+
+    s = src_mod.store()
+    registered = s.listing() if s else []
+    rows = []
+    for src in registered:
+        if not src.get("enabled"):
+            continue
+        key = (src.get("paper") or "", src.get("edition") or "")
+        got = collected.get(key)
+        rows.append({
+            "source_id": src["id"], "paper": key[0], "edition": key[1],
+            "lang": src.get("lang") or "", "registered": True,
+            "n": (got or {}).get("n", 0),
+            "labelled": (got or {}).get("labelled", 0),
+            "pages": (got or {}).get("pages", []),
+            "categories": (got or {}).get("categories", []),
+            # Three states, not two, and "failed" is about THIS day. A paper
+            # that failed yesterday and has not been tried today is waiting,
+            # not failed -- showing it red taught the reader to ignore red,
+            # which is the one thing the colour is for. Before ~06:00 nearly
+            # every paper is legitimately waiting.
+            "status": ("collected" if got else
+                       "failed" if (src.get("last_error")
+                                    and src.get("last_error_date") == day)
+                       else "waiting"),
+            "last_date": src.get("last_date") or "",
+            "last_error": (src.get("last_error") or "")[:160],
+            "fail_count": src.get("fail_count") or 0})
+
+    # Deliberately NOT padded with whatever else was extracted that day. A
+    # one-off run from the New tab is somebody's experiment, and listing it
+    # here made the Daily Reader answer a different question than it asks:
+    # this page is "did the papers I subscribed to arrive", and three Tribune
+    # editions nobody subscribed to sitting above two Telugu papers that did
+    # not is the wrong answer to it. Those articles are still in Browse.
+    rows.sort(key=lambda r: (r["status"] != "collected", -r["n"], r["paper"]))
+    return {"date": day,
+            "total": sum(r["n"] for r in rows),
+            "collected": sum(1 for r in rows if r["status"] == "collected"),
+            "waiting": sum(1 for r in rows if r["status"] == "waiting"),
+            "failed": sum(1 for r in rows if r["status"] == "failed"),
+            "sources": rows,
+            "schedule": _schedule_state()}
+
+
+def _schedule_state() -> dict:
+    """
+    Whether the nightly collection is actually registered with Windows.
+
+    Read from Task Scheduler rather than from a setting of our own, because a
+    setting would say "on" while the task had been deleted, disabled, or never
+    created on this machine -- and the whole point of this panel is to answer
+    "will it run tonight without me".
+    """
+    try:
+        out = subprocess.run(
+            ["schtasks", "/Query", "/TN", SCHEDULED_TASK, "/FO", "LIST"],
+            capture_output=True, text=True, timeout=10)
+    except Exception as ex:
+        return {"supported": False, "registered": False, "detail": str(ex)[:120]}
+    if out.returncode != 0:
+        return {"supported": True, "registered": False, "detail": ""}
+    info = {}
+    for line in (out.stdout or "").splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            info[k.strip().lower()] = v.strip()
+    return {"supported": True, "registered": True,
+            "status": info.get("status", ""),
+            "next_run": info.get("next run time", ""),
+            "last_run": info.get("last run time", ""),
+            "last_result": info.get("last result", "")}
+
+
+@app.post("/api/daily/collect")
+def daily_collect(background: BackgroundTasks, date: str = None):
+    """
+    Run tonight's collection now, for every enabled source not yet done.
+
+    The same work the scheduled task does, on demand -- for the first run
+    after registering a paper, and for the morning after a night the machine
+    was asleep.
+    """
+    s = source_store()
+    day = date or dt.date.today().isoformat()
+    due = s.due(day)
+    if not due:
+        return {"started": False, "date": day, "due": 0,
+                "detail": "every enabled paper already has %s" % day}
+    background.add_task(_collect_due, day)
+    return {"started": True, "date": day, "due": len(due),
+            "papers": [r.get("paper") for r in due]}
+
+
+_collecting = threading.Lock()
+
+
+def _collect_due(day: str):
+    """
+    One edition job per due source, in series. Failures are per-paper.
+
+    Serialised across requests. Pressing Collect now twice used to start two
+    rounds, and because a source is only marked after its job finishes, both
+    read the same due list and fetched the same edition -- six identical
+    Himachal Tribune jobs in the history, all doing the same work.
+    """
+    if not _collecting.acquire(blocking=False):
+        print("daily: a collection is already running; ignoring this one")
+        return
+    try:
+        s = source_store()
+        for src in s.due(day):
+            jid = _create({"source": "ingest"}, src.get("paper") or src["host"],
+                          src.get("edition", ""), day, 0, True)
+            set_job(jid, kind="edition")
+            try:
+                run_ingest_job(jid, {
+                    "source": "ingest", "host": src["host"],
+                    "title_id": src["title_id"], "date": day,
+                    "paper": src.get("paper") or src["host"],
+                    "edition": src.get("edition", ""),
+                    "max_pages": int(src.get("max_pages") or 0),
+                    "force": False})
+            except Exception as ex:
+                # Recorded against the title, not raised: one paper that has
+                # not published by 02:00 must not stop the rest of the round.
+                print("daily: %s raised: %s" % (src.get("paper"), ex))
+                s.mark_failed(src["id"], str(ex)[:200], day)
+                continue
+
+            # The job's OWN status, not the absence of an exception.
+            # run_ingest_job catches its failures and records them as
+            # status="error" rather than raising, so a try/except around it
+            # never fires -- and this marked Sakshi collected on a day it
+            # published nothing. `due()` then skipped it for the rest of the
+            # day, so the retry that should have happened at the next run
+            # never did. scripts/daily.py has always checked the status; this
+            # is the same rule, in the one place that had drifted from it.
+            j = jobs_store().get(jid) or {}
+            if j.get("status") == "done":
+                s.mark_done(src["id"], day, pages=j.get("pages_done") or 0,
+                            articles=j.get("n_articles") or 0)
+            else:
+                s.mark_failed(src["id"],
+                              j.get("error") or "job did not finish", day)
+    finally:
+        _collecting.release()
+
+
+@app.post("/api/daily/schedule")
+def daily_schedule(payload: dict = None):
+    """
+    Register (or remove) the nightly run with Windows Task Scheduler.
+
+    Deliberately not a thread inside this process. An in-process timer stops
+    the moment the app does -- a closed terminal, a reboot, a crash -- and
+    gives no way to answer "did last night run" except by reading logs. A
+    scheduled task survives all of those, runs whether or not the app is open,
+    and records its own exit code, which is why scripts/daily.py exits 1 when
+    any paper failed.
+    """
+    payload = payload or {}
+    if not payload.get("enabled", True):
+        out = subprocess.run(["schtasks", "/Delete", "/TN", SCHEDULED_TASK, "/F"],
+                             capture_output=True, text=True, timeout=20)
+        if out.returncode != 0 and "cannot find" not in (out.stderr or "").lower():
+            raise HTTPException(500, (out.stderr or "could not remove")[:200])
+        return {"registered": False}
+
+    at = str(payload.get("at") or "05:30")
+    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", at):
+        raise HTTPException(400, "at must be HH:MM in 24-hour time")
+
+    py = sys.executable
+    root = os.path.dirname(HERE)
+    script = os.path.join(root, "scripts", "daily.py")
+    if not os.path.exists(script):
+        raise HTTPException(500, "scripts/daily.py not found at %s" % script)
+
+    # Registered through the ScheduledTasks cmdlets rather than schtasks.exe,
+    # because three of schtasks' defaults quietly stop this from being a daily
+    # collection at all on a laptop:
+    #
+    #   StartWhenAvailable=False        the machine is asleep at 05:30, the run
+    #                                   is skipped outright and never caught up
+    #   DisallowStartIfOnBatteries=True unplugged, it does not start
+    #   StopIfGoingOnBatteries=True     unplug mid-run and it is killed
+    #
+    # Together those mean "collect every day" would have meant "collect on
+    # days the machine happened to be awake and on mains at exactly 05:30".
+    # schtasks.exe cannot set any of them; these cmdlets can.
+    #
+    # WakeToRun is deliberately NOT set. Waking somebody's machine at dawn to
+    # fetch a newspaper is not a reasonable thing to do uninvited, and
+    # StartWhenAvailable already covers the case -- the run happens shortly
+    # after the machine next wakes.
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "$a = New-ScheduledTaskAction -Execute '{py}'"
+        " -Argument '\"{script}\"' -WorkingDirectory '{root}';"
+        "$t = New-ScheduledTaskTrigger -Daily -At {at};"
+        "$s = New-ScheduledTaskSettingsSet -StartWhenAvailable"
+        " -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries"
+        " -ExecutionTimeLimit (New-TimeSpan -Hours 6)"
+        " -MultipleInstances IgnoreNew;"
+        "Register-ScheduledTask -TaskName '{task}' -Action $a -Trigger $t"
+        " -Settings $s -Description 'Clipping Desk: collect registered"
+        " newspapers for today' -Force | Out-Null;"
+        "'ok'"
+    ).format(py=py.replace("'", "''"), script=script.replace("'", "''"),
+             root=root.replace("'", "''"), at=at, task=SCHEDULED_TASK)
+
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                          "-Command", ps],
+                         capture_output=True, text=True, timeout=60)
+    if out.returncode != 0:
+        raise HTTPException(500, (out.stderr or out.stdout or "failed")[:250])
+    return dict({"registered": True, "at": at,
+                 "command": '"%s" "%s"' % (py, script)},
+                **_schedule_state())
+
+
+@app.get("/api/sources")
+def sources_list(enabled_only: bool = False, due_for: str = None):
+    """
+    The titles registered for collection.
+
+    `due_for=<date>` answers the scheduler's question -- enabled titles with
+    nothing collected for that date yet.
+    """
+    s = src_mod.store()
+    if not s:
+        return {"available": False, "error": src_mod.last_error(), "sources": []}
+    try:
+        rows = s.due(due_for) if due_for else s.listing(enabled_only=enabled_only)
+        return {"available": True, "sources": rows}
+    except Exception as ex:
+        return {"available": False, "error": str(ex)[:200], "sources": []}
+
+
+@app.post("/api/sources")
+def source_add(payload: dict):
+    """Register a title for daily collection, or update its settings."""
+    if not payload.get("host") or not payload.get("title_id"):
+        raise HTTPException(400, "host and title_id are required")
+    paper = payload.get("paper") or next(
+        (p["name"] for p in CATALOGUE if p["host"] == payload["host"]),
+        payload["host"])
+    try:
+        return source_store().add(
+            host=payload["host"], title_id=payload["title_id"], paper=paper,
+            edition=payload.get("edition", ""),
+            lang=payload.get("lang") or lang_of(payload["host"]),
+            max_pages=int(payload.get("max_pages") or 0),
+            enabled=bool(payload.get("enabled", True)))
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+
+
+@app.patch("/api/sources/{sid:path}")
+def source_patch(sid: str, payload: dict):
+    """
+    Change a title's settings without forgetting its collection history.
+
+    Both fields are optional and applied independently, so a request that
+    only changes the page limit does not have to restate whether the title is
+    enabled -- and cannot accidentally re-enable one somebody switched off.
+    """
+    if "enabled" not in payload and "max_pages" not in payload:
+        raise HTTPException(
+            400, "nothing to change; send enabled and/or max_pages")
+    try:
+        s = source_store()
+        row = None
+        if "enabled" in payload:
+            row = s.set_enabled(sid, bool(payload["enabled"]))
+        if "max_pages" in payload:
+            n = int(payload["max_pages"] or 0)
+            if n < 0 or n > 200:
+                raise HTTPException(400, "max_pages must be 0-200 (0 = all)")
+            row = s.set_max_pages(sid, n)
+        return row
+    except KeyError:
+        raise HTTPException(404, "no such source: %s" % sid)
+
+
+@app.delete("/api/sources/{sid:path}")
+def source_delete(sid: str):
+    try:
+        return source_store().remove(sid)
+    except KeyError:
+        raise HTTPException(404, "no such source: %s" % sid)
+
+
+@app.post("/api/jobs/topic")
+def topic_job(background: BackgroundTasks, payload: dict):
+    archive = payload.get("scope") == "archive"
+    # An archive search needs no publisher and no page, because it fetches
+    # nothing -- requiring a host and a date to search dates already stored
+    # would be asking for the answer as a precondition of the question.
+    required = ("topic",) if archive else ("host", "title_id", "date", "topic")
+    for k in required:
+        if not payload.get(k):
+            raise HTTPException(400, "missing %s" % k)
+    host = payload.get("host") or ""
     paper = next((p["name"] for p in CATALOGUE if p["host"] == host), host)
-    plat = platform_of(host)
+    plat = platform_of(host) if host else "archive"
     mode = payload.get("mode") or "hybrid"
     if mode not in ("hybrid", "keywords"):
         raise HTTPException(400, "mode must be 'hybrid' or 'keywords'")
+    if payload.get("proximity") and payload["proximity"] not in epaper_query.WINDOWS:
+        raise HTTPException(400, "proximity must be one of %s"
+                            % ", ".join(epaper_query.WINDOWS))
+    if payload.get("timeframe") and payload["timeframe"] not in epaper_query.TIMEFRAMES:
+        raise HTTPException(400, "timeframe must be one of %s"
+                            % ", ".join(epaper_query.TIMEFRAMES))
     kw = keywords.expand(payload["topic"])
     jid = uuid.uuid4().hex[:12]
-    with _lock, db() as c:
-        c.execute("""INSERT INTO jobs(id,created,source,paper,edition,date,
-            page_no,status,stage,kind,topic,mode,beat)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (jid, dt.datetime.now().isoformat(timespec="seconds"),
-                   plat, paper, payload.get("edition", ""), payload["date"],
-                   0, "queued", "queued", "topic", payload["topic"], mode,
-                   kw["beat"] or ""))
+    jobs_store().create(
+        jid, created=dt.datetime.now().isoformat(timespec="seconds"),
+        source=plat, paper=paper, edition=payload.get("edition", ""),
+        date=payload.get("date") or "", page_no=0, status="queued",
+        stage="queued", kind="topic", topic=payload["topic"],
+        mode="archive" if archive else mode, beat=kw["beat"] or "")
     # `paper` is resolved from the catalogue here, not carried in the payload,
     # so it has to be passed explicitly -- the corpus derives an article's
     # identity from it, and an empty paper silently breaks deduplication.
-    background.add_task(run_topic_job, jid, {**payload, "platform": plat,
-                                             "mode": mode, "paper": paper,
-                                             "title_id": str(payload["title_id"])})
-    return {"job_id": jid, "platform": plat, "mode": mode,
+    job_spec = {**payload, "platform": plat, "mode": mode,
+                "paper": paper if host else "",
+                "title_id": str(payload.get("title_id") or "")}
+    if archive:
+        # Inline, not backgrounded. It is one indexed read, so returning a
+        # queued job the caller then has to poll would add latency to hide
+        # latency that is not there.
+        run_topic_job(jid, job_spec)
+    else:
+        background.add_task(run_topic_job, jid, job_spec)
+    return {"job_id": jid, "platform": plat,
+            "mode": "archive" if archive else mode,
             "beat": kw["beat"], "n_terms": len(kw["terms"])}
 
 
 @app.get("/api/search")
 def search(q: str, paper: str = None, date_from: str = None,
-           date_to: str = None, beat: str = None, limit: int = 50,
-           min_score: float = 0.0):
+           date_to: str = None, beat: str = None, category: str = None,
+           subcategory: str = None, tag: str = None, limit: int = 50,
+           min_score: float = 0.0, exclude: str = None,
+           proximity: str = None, weekdays: str = None,
+           timeframe: str = None):
     """
     Search everything ever extracted. No page fetch, no model, milliseconds.
 
     This is the query path the topic job is not: a topic job re-reads a page to
     answer one question, while this answers any number of questions about every
     page already read.
+
+    `timeframe` is a convenience over date_from/date_to -- "week", "month" and
+    the rest resolve here rather than in the browser, so a request made at
+    23:59 and served at 00:01 still means the day the reader was looking at.
+    Explicit dates win when both are given.
     """
     c = corpus()
     if not c:
         raise HTTPException(503, "corpus unavailable: %s" % (_corpus_err or "mongodb down"))
+    if timeframe and not (date_from or date_to):
+        date_from, date_to = epaper_query.resolve_timeframe(timeframe)
     try:
         return c.search(q, paper=paper, date_from=date_from, date_to=date_to,
-                        beat=beat, limit=min(limit, 200), min_score=min_score)
+                        beat=beat, category=category, subcategory=subcategory,
+                        tag=tag, limit=min(limit, 200), min_score=min_score,
+                        exclude=exclude, proximity=proximity,
+                        weekdays=(weekdays or "").split(",") if weekdays else None)
     except Exception as ex:
         raise HTTPException(500, "search failed: %s" % str(ex)[:200])
+
+
+# ------------------------------------------------------------------ browse
+#
+# The reader who has a date rather than a question. Three endpoints, none of
+# which scores, expands or calls a model -- each is one indexed read, so the
+# whole journey costs milliseconds however large the archive grows.
+
+@app.get("/api/corpus/dates")
+def corpus_dates(paper: str = None, limit: int = 120):
+    """
+    Days the archive holds, newest first, with article counts.
+
+    Deliberately not /api/dates, which already exists and answers a different
+    question -- what the PUBLISHER has available to fetch. This one is what we
+    have already read. Conflating them would make an empty archive look like a
+    paper that never published.
+    """
+    c = corpus()
+    if not c:
+        return []
+    try:
+        return c.dates(paper=paper, limit=min(limit, 400))
+    except Exception as ex:
+        raise HTTPException(500, "dates failed: %s" % str(ex)[:200])
+
+
+@app.get("/api/facets")
+def facets(date: str = None, paper: str = None, date_from: str = None,
+           date_to: str = None, category: str = None, limit: int = 40,
+           timeframe: str = None):
+    """
+    Which categories appeared on a day, and how many articles each holds.
+
+    Pass `category` to scope the returned tags to that category -- those tags
+    are its sub-categories.
+    """
+    c = corpus()
+    if not c:
+        raise HTTPException(503, "corpus unavailable: %s"
+                            % (_corpus_err or "mongodb down"))
+    # Resolved here, not in the browser: a page opened before midnight and
+    # used after it would otherwise keep asking for the wrong "today".
+    if timeframe and not (date or date_from or date_to):
+        date_from, date_to = epaper_query.resolve_timeframe(timeframe)
+    try:
+        return c.facets(date=date, paper=paper, date_from=date_from,
+                        date_to=date_to, category=category,
+                        limit=min(limit, 200))
+    except Exception as ex:
+        raise HTTPException(500, "facets failed: %s" % str(ex)[:200])
+
+
+@app.get("/api/categories/tree")
+def categories_tree(date: str = None, paper: str = None,
+                    date_from: str = None, date_to: str = None,
+                    limit: int = 30, sub_limit: int = 8, min_sub: int = 2):
+    """
+    Categories with their sub-categories, in one call.
+
+    Nothing declares this hierarchy. A sub-category is a tag that occurs
+    inside a category -- "murder" within "crime" -- so the tree is a
+    co-occurrence count over what the classifier already produced, and it
+    updates itself every night without anybody maintaining a taxonomy.
+    """
+    c = corpus()
+    if not c:
+        raise HTTPException(503, "corpus unavailable: %s"
+                            % (_corpus_err or "mongodb down"))
+    try:
+        return c.tree(date=date, paper=paper, date_from=date_from,
+                      date_to=date_to, limit=min(limit, 100),
+                      sub_limit=min(sub_limit, 30), min_sub=min_sub)
+    except Exception as ex:
+        raise HTTPException(500, "tree failed: %s" % str(ex)[:200])
+
+
+@app.post("/api/categories")
+def category_create(payload: dict):
+    """
+    Add a topic by hand, before the classifier has ever produced it.
+
+    The list is normally grown by the classifier, which is the point of
+    free-form labelling. This is for the cases that design does not cover: a
+    subject you know is coming, a heading you want articles filed under today,
+    or a target to merge two sloppy entries into.
+
+    Created at zero articles, so it appears in the picker and in the merge
+    target list without pretending anything is filed under it yet.
+    """
+    label = (payload.get("label") or payload.get("id") or "").strip()
+    if not label:
+        raise HTTPException(400, "send {\"label\": \"...\"}")
+    filed = catdata.normalise(label)
+    if not filed:
+        raise HTTPException(
+            400, "%r is not usable as a topic -- one to three words, not a "
+                 "sentence" % label[:60])
+    s = cat_mod.store()
+    if not s:
+        raise HTTPException(503, "categories unavailable: %s" % cat_mod.last_error())
+    if s.get(filed):
+        return s.get(filed)
+    s.create(filed, display=payload.get("display") or "")
+    return s.get(filed)
+
+
+@app.patch("/api/article/{uid}")
+def article_patch(uid: str, payload: dict):
+    """
+    Correct one article's topic or tags.
+
+    The counterpart to the review queue: that screen fixes the topic LIST,
+    this fixes one ARTICLE. Both are needed -- merging "roadworks" into
+    "infrastructure" does nothing for a story the classifier filed under
+    "politics" by mistake.
+
+    A correction made here is marked as human and survives every later bulk
+    relabel.
+    """
+    if "category" not in payload and "tags" not in payload:
+        raise HTTPException(
+            400, "send {\"category\": \"...\"} and/or {\"tags\": [...]}")
+    c = corpus()
+    if not c:
+        raise HTTPException(503, "corpus unavailable: %s"
+                            % (_corpus_err or "mongodb down"))
+    cat = payload.get("category")
+    if isinstance(cat, str) and cat.strip() and not catdata.normalise(cat):
+        raise HTTPException(
+            400, "%r is not usable as a topic -- one to three words, not a "
+                 "sentence" % cat[:60])
+    try:
+        return c.set_topic(uid, category=cat, tags=payload.get("tags"))
+    except KeyError:
+        raise HTTPException(404, "no such article: %s" % uid)
+
+
+@app.get("/api/categories/unplaced")
+def categories_unplaced(min_count: int = 1):
+    """Subcategories with no heading yet, most-used first."""
+    s = cat_mod.store()
+    if not s:
+        raise HTTPException(503, "categories unavailable: %s" % cat_mod.last_error())
+    return {"unplaced": s.unplaced(min_count=min_count)}
+
+
+@app.post("/api/categories/assign-parents")
+def categories_assign_parents(min_count: int = 1, limit: int = 200):
+    """
+    Place every unplaced subcategory under a heading, using the model.
+
+    Costs one call per twenty-five LABELS, not per article: an archive with
+    200 distinct subcategories is eight calls however many articles carry
+    them. Obvious ones never reach the model at all -- catdata.SEED_PARENTS
+    answers them for free.
+    """
+    s = cat_mod.store()
+    if not s:
+        raise HTTPException(503, "categories unavailable: %s" % cat_mod.last_error())
+    rows = s.unplaced(min_count=min_count)[:limit]
+    if not rows:
+        return {"asked": 0, "placed": 0, "unplaced": 0, "assignments": {}}
+    h = vlm.health()
+    if not h.get("available"):
+        raise HTTPException(503, "model server unavailable: %s"
+                            % (h.get("error") or "unknown")[:200])
+    got = classify.assign_parents([r["id"] for r in rows])
+    placed = 0
+    for lab, parent in got.items():
+        if not parent:
+            continue
+        try:
+            s.set_parent(lab, parent)
+            placed += 1
+        except Exception:
+            pass
+    return {"asked": len(rows), "placed": placed,
+            "unplaced": len(s.unplaced(min_count=min_count)),
+            "assignments": {k: v for k, v in got.items() if v}}
+
+
+@app.patch("/api/categories/{cat_id:path}/parent")
+def category_set_parent(cat_id: str, payload: dict):
+    """Place one subcategory under a heading by hand, or unplace it."""
+    s = cat_mod.store()
+    if not s:
+        raise HTTPException(503, "categories unavailable: %s" % cat_mod.last_error())
+    try:
+        return s.set_parent(cat_id, payload.get("parent") or "")
+    except KeyError:
+        raise HTTPException(404, "no such category: %s" % cat_id)
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+
+
+# The two-level tree is served from /api/categories/tree above, derived by
+# co-occurrence over what the classifier already produced. The registry's own
+# parent links are not a second source of truth for it -- they exist so that
+# labels predating the second level can be placed under a heading (see
+# scripts/build_tree.py), and are surfaced as a queue below.
+
+
+
+
+@app.get("/api/categories/headings")
+def category_headings():
+    """
+    The fixed top level, with what each heading means and what files under it.
+
+    Controlled on purpose -- see epaper/catdata.py. Returned in full rather
+    than as bare ids because this is what the Categories tab shows a reader
+    who wants to know the scheme before correcting anything, and a list of
+    twenty one-word ids does not tell anybody where an article belongs.
+
+    `desk` marks the five police headings. `children` is only the SEEDED
+    subcategories -- the ones decided in advance. What the classifier has
+    actually invented is a different question, answered by /api/categories.
+    """
+    return {
+        "headings": [{
+            "id": p,
+            "label": catdata.display(p),
+            "note": catdata.PARENT_NOTES.get(p, ""),
+            "desk": p in catdata.POLICE_PARENTS,
+            "children": catdata.children_of(p),
+        } for p in catdata.PARENTS],
+        "police_desk": catdata.POLICE_PARENTS,
+        "unclassified": catdata.UNKNOWN,
+        # Stated because it is the question people ask about a bilingual
+        # archive, and because the answer is not obvious from the list: the
+        # headings are English regardless of the paper's language, since a
+        # corpus labelled in each article's own language splits every subject
+        # in two and neither half is complete.
+        "language_note": (
+            "Headings are English whatever language the paper is in — a "
+            "Telugu, Hindi or English article about a robbery all file under "
+            "crime. The original wording is kept in tags and in the article "
+            "text, so searching in the paper's own language still works."),
+    }
+
+
+@app.post("/api/categories/merge")
+def categories_merge(payload: dict):
+    """
+    File everything under one topic as another, now and in future.
+
+    The review queue's only destructive-looking action, and it is reversible:
+    the merged entry stays, pointing at its target, so a label arriving
+    tomorrow still lands in the right place and the decision remains visible.
+    """
+    src, dst = (payload.get("src") or "").strip(), (payload.get("dst") or "").strip()
+    if not src or not dst:
+        raise HTTPException(400, "send {\"src\": ..., \"dst\": ...}")
+    s = cat_mod.store()
+    if not s:
+        raise HTTPException(503, "categories unavailable: %s" % cat_mod.last_error())
+    c = corpus()
+    try:
+        return s.merge(src, dst, articles=c.articles if c else None)
+    except KeyError:
+        raise HTTPException(404, "no such topic: %s" % src)
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+
+
+@app.patch("/api/categories/{cat_id:path}")
+def category_patch(cat_id: str, payload: dict):
+    """Hide a topic from the picker, or rename how it is displayed."""
+    s = cat_mod.store()
+    if not s:
+        raise HTTPException(503, "categories unavailable: %s" % cat_mod.last_error())
+    try:
+        if "hidden" in payload:
+            return s.set_hidden(cat_id, bool(payload["hidden"]))
+        if payload.get("label"):
+            return s.rename(cat_id, payload["label"])
+        raise HTTPException(400, "send {\"hidden\": bool} or {\"label\": str}")
+    except KeyError:
+        raise HTTPException(404, "no such topic: %s" % cat_id)
+
+
+@app.post("/api/categories/rebuild")
+def categories_rebuild():
+    """
+    Recount the topic list from the articles themselves.
+
+    Stored counts are incremented as articles arrive, so they drift when
+    articles are deleted, re-ingested or relabelled. The articles are the
+    truth; this makes the list agree with them.
+    """
+    s = cat_mod.store()
+    c = corpus()
+    if not s or not c:
+        raise HTTPException(503, "categories or corpus unavailable")
+    return s.rebuild(c.articles)
+
+
+@app.get("/api/browse")
+def browse(date: str = None, category: str = None, subcategory: str = None,
+           paper: str = None, tag: str = None, date_from: str = None,
+           date_to: str = None, page: int = 1, per_page: int = 50,
+           timeframe: str = None):
+    """
+    A day's articles, or one topic within it, in the order they were printed.
+
+    At least one narrowing filter is required. Without one this is "every
+    article ever extracted, page 1", which is not a question anybody asked and
+    gets slower every night the archive runs.
+    """
+    if timeframe and not (date or date_from or date_to):
+        date_from, date_to = epaper_query.resolve_timeframe(timeframe)
+    if not any([date, category, subcategory, paper, tag, date_from, date_to]):
+        raise HTTPException(
+            400, "give at least one of: date, category, paper, tag, "
+                 "date_from, date_to, timeframe")
+    c = corpus()
+    if not c:
+        raise HTTPException(503, "corpus unavailable: %s"
+                            % (_corpus_err or "mongodb down"))
+    try:
+        return c.browse(date=date, category=category, subcategory=subcategory,
+                        paper=paper, tag=tag, date_from=date_from,
+                        date_to=date_to, page=page, per_page=per_page)
+    except Exception as ex:
+        raise HTTPException(500, "browse failed: %s" % str(ex)[:200])
+
+
+@app.get("/api/categories")
+def categories_list(min_count: int = 1, include_hidden: bool = False):
+    """
+    The topic list as it stands, most-used first.
+
+    Reads the registry rather than aggregating the articles, so it carries the
+    display labels and merge decisions that the raw facet counts do not.
+    """
+    s = cat_mod.store()
+    if not s:
+        return {"available": False, "error": cat_mod.last_error(),
+                "categories": []}
+    try:
+        return {"available": True,
+                "categories": s.listing(min_count=min_count,
+                                        include_hidden=include_hidden)}
+    except Exception as ex:
+        return {"available": False, "error": str(ex)[:200], "categories": []}
 
 
 @app.get("/api/article/{uid}")
@@ -1154,12 +2250,14 @@ def corpus_stats():
     c = corpus()
     if not c:
         return {"available": False, "error": _corpus_err or "mongodb down",
-                "connection": conn, "articles": 0, "by_paper": [], "by_beat": []}
+                "connection": conn, "articles": 0, "by_paper": [],
+                "by_beat": [], "by_category": []}
     try:
         return {"available": True, "connection": conn, **c.stats()}
     except Exception as ex:
         return {"available": False, "error": str(ex)[:200],
-                "connection": conn, "articles": 0, "by_paper": [], "by_beat": []}
+                "connection": conn, "articles": 0, "by_paper": [],
+                "by_beat": [], "by_category": []}
 
 
 @app.post("/api/corpus/rescore")
@@ -1176,10 +2274,70 @@ def corpus_rescore():
     return c.rescore()
 
 
+@app.post("/api/corpus/reclassify")
+def corpus_reclassify(only_unlabelled: bool = True, limit: int = 0,
+                      date: str = None, paper: str = None):
+    """
+    Assign topics to articles already extracted.
+
+    Runs synchronously and can take minutes -- roughly 3.6 s per article on a
+    3B model. Pass `limit` to sample before committing to a whole archive.
+    """
+    c = corpus()
+    if not c:
+        raise HTTPException(503, "corpus unavailable: %s"
+                            % (_corpus_err or "mongodb down"))
+    h = vlm.health()
+    if not h.get("available"):
+        # Checked up front rather than discovered per article. Without this
+        # the run "succeeds" having marked every article as a failure, which
+        # then has to be undone.
+        raise HTTPException(503, "model server unavailable: %s"
+                            % (h.get("error") or "unknown")[:200])
+    try:
+        return c.reclassify(only_unlabelled=only_unlabelled, limit=limit,
+                            date=date, paper=paper)
+    except Exception as ex:
+        raise HTTPException(500, "reclassify failed: %s" % str(ex)[:200])
+
+
+def backfill_rows(job: dict, arts: list) -> list:
+    """
+    A job's rows, with `category` kept only where it means a subject.
+
+    That field does not mean one thing, and which thing it means is decided by
+    the job's kind:
+
+        page, edition   the classifier's subject -- "politics", "crime"
+        topic           the BEAT LABEL -- "Delhi Police", for the results view
+
+    Passing a topic job's value through files a police force as a subject and
+    rebuilds the exact collision the primary_beat/category split removed.
+
+    Discarding ALL of them -- which is what this did -- is the other half of
+    that mistake and the more expensive half. It stripped the classifier's work
+    off every page and edition job on the way in, so a backfill left 103 of 104
+    articles with an empty category while their own job rows still held
+    "politics", "crime" and "business". Browse then had nothing to group by and
+    looked broken, because it was.
+
+    A separate function, and not an inline loop, so the rule can be tested
+    without running a backfill against the live corpus.
+    """
+    if (job.get("kind") or "page") != "topic":
+        return arts
+    out = []
+    for a in arts:
+        a = dict(a)
+        a.pop("category", None)
+        out.append(a)
+    return out
+
+
 @app.post("/api/corpus/backfill")
 def corpus_backfill():
     """
-    Index articles already sitting in SQLite from previous runs.
+    Index articles from previous runs into the searchable corpus.
 
     Extraction is the expensive part and it has already been paid for; there is
     no reason for earlier jobs to be invisible to search.
@@ -1188,61 +2346,57 @@ def corpus_backfill():
     if not c:
         raise HTTPException(503, "corpus unavailable: %s" % (_corpus_err or "mongodb down"))
     total = {"added": 0, "updated": 0, "skipped": 0, "jobs": 0}
-    with db() as conn:
-        # Oldest first, explicitly. An article dedupes on a uid keyed to page
-        # geometry rather than text, so every extraction of one page writes to
-        # the same document and the last write wins. Re-extracting a page after
-        # fixing the reader therefore leaves several rows in SQLite holding the
-        # same story at different quality -- observed here as three jobs for
-        # Tribune p1, two carrying "SCtellsSIT" and one "SC tells SIT".
-        #
-        # Unordered, which row landed last was whatever the database happened
-        # to return, so this button could silently revert a headline to an
-        # older, worse reading of it. It worked only because SQLite returns
-        # insertion order when not asked otherwise, which is not a guarantee to
-        # rely on for something that overwrites the corpus.
-        jobs = conn.execute(
-            "SELECT id,paper,edition,date,page_no FROM jobs "
-            "WHERE status='done' ORDER BY created"
-        ).fetchall()
-        for j in jobs:
-            arts = [dict(a) for a in conn.execute(
-                "SELECT * FROM articles WHERE job_id=?", (j["id"],)).fetchall()]
-            if not arts:
-                continue
-            r = c.ingest(arts, job_id=j["id"], paper=j["paper"] or "",
-                         edition=j["edition"] or "", date=j["date"] or "",
-                         default_page=j["page_no"] or 0)
-            for k in ("added", "updated", "skipped"):
-                total[k] += r[k]
-            total["jobs"] += 1
+    # Oldest first, explicitly. An article dedupes on a uid keyed to page
+    # geometry rather than text, so every extraction of one page writes to
+    # the same document and the last write wins. Re-extracting a page after
+    # fixing the reader therefore leaves several rows holding the same
+    # story at different quality -- observed here as three jobs for
+    # Tribune p1, two carrying "SCtellsSIT" and one "SC tells SIT".
+    #
+    # Unordered, which row landed last was whatever the database happened
+    # to return, so this button could silently revert a headline to an
+    # older, worse reading of it.
+    s = jobs_store()
+    for j, arts in s.with_articles(oldest_first=True):
+        if j.get("status") != "done":
+            continue
+        arts = backfill_rows(j, arts)
+        r = c.ingest(arts, job_id=j["id"], paper=j["paper"] or "",
+                     edition=j["edition"] or "", date=j["date"] or "",
+                     default_page=j["page_no"] or 0)
+        for k in ("added", "updated", "skipped"):
+            total[k] += r[k]
+        total["jobs"] += 1
     return total
 
 
 @app.get("/api/jobs")
-def list_jobs(limit: int = 60):
-    with db() as c:
-        rows = c.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT ?",
-                         (limit,)).fetchall()
-    return [dict(r) for r in rows]
+def list_jobs(limit: int = 60, kind: str = None):
+    """
+    Recent jobs, newest first.
+
+    `kind` accepts a comma-separated list, because the New tab wants the runs
+    a person started by hand -- "page,upload" -- and those are two kinds, not
+    one. Without it the tab would show last night's edition collection mixed
+    in with the reader's own extractions, which are separate activities that
+    only happen to share a table.
+    """
+    kinds = [k.strip() for k in (kind or "").split(",") if k.strip()]
+    return jobs_store().listing(limit, kinds=kinds or None)
 
 
 @app.get("/api/jobs/{jid}")
 def get_job(jid: str):
-    with db() as c:
-        j = c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
-        if not j:
-            raise HTTPException(404, "no such job")
-        arts = c.execute("SELECT * FROM articles WHERE job_id=? ORDER BY seq",
-                         (jid,)).fetchall()
-    return {"job": dict(j), "articles": [dict(a) for a in arts]}
+    s = jobs_store()
+    j = s.get(jid)
+    if not j:
+        raise HTTPException(404, "no such job")
+    return {"job": j, "articles": s.rows(jid)}
 
 
 @app.delete("/api/jobs/{jid}")
 def delete_job(jid: str):
-    with _lock, db() as c:
-        c.execute("DELETE FROM jobs WHERE id=?", (jid,))
-        c.execute("DELETE FROM articles WHERE job_id=?", (jid,))
+    jobs_store().delete(jid)
     shutil.rmtree(os.path.join(JOBS, jid), ignore_errors=True)
     return {"ok": True}
 
@@ -1311,11 +2465,28 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--reload", action="store_true",
+                    help="restart on a Python source change (development)")
     a = ap.parse_args()
     init_db()
     import uvicorn
     print("UI  ->  http://%s:%d" % (a.host, a.port))
-    uvicorn.run(app, host=a.host, port=a.port, log_level="info")
+    if not a.reload:
+        uvicorn.run(app, host=a.host, port=a.port, log_level="info")
+        return
+    # Reload needs an import string rather than the object: uvicorn re-imports
+    # the module in a fresh child process on every change, and cannot re-import
+    # an object it was handed. app_dir puts web/ on sys.path so "app:app"
+    # resolves without web/ having to be a package.
+    #
+    # Only these two directories are watched. web/data holds the job SQLite and
+    # every page image a run writes, so watching the tree wholesale would have
+    # each extraction restart the server mid-job. uvicorn matches *.py by
+    # default, which keeps the images out on its own -- naming the directories
+    # keeps the database out too.
+    uvicorn.run("app:app", host=a.host, port=a.port, log_level="info",
+                reload=True, app_dir=HERE,
+                reload_dirs=[HERE, os.path.join(ROOT, "epaper")])
 
 
 if __name__ == "__main__":

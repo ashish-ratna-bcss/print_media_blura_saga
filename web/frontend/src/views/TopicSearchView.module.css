@@ -333,3 +333,150 @@
   text-transform: uppercase;
   color: var(--good);
 }
+
+/* -- refinements -------------------------------------------------------- */
+
+/* The suggestion list collapses because nine of them pushed the engine
+   toggle and the search button off the screen. */
+.disclosure {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  margin-top: 16px;
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.disclosureMeta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.caret,
+.caretOpen {
+  transition: transform var(--dur) var(--ease);
+}
+.caret {
+  transform: rotate(-90deg);
+}
+
+/* The selected suggestion is the current topic, so it reads as chosen rather
+   than merely hovered -- clicking it again clears it. */
+.chipOn {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.refine {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border-soft);
+  display: grid;
+  gap: 14px;
+}
+
+.refineGrid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  align-items: start;
+}
+
+.switch {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+
+.switch:hover {
+  background: var(--surface-2);
+}
+
+.switch:has(input:checked) {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-soft);
+}
+
+.switch input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.switch > span {
+  display: grid;
+  gap: 2px;
+}
+
+.switch strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.switchHint,
+.fieldHint {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.fieldHint {
+  margin: 5px 0 0;
+  color: var(--text-3);
+}
+
+/* -- weekday picker ----------------------------------------------------- */
+
+.days {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.day {
+  flex: 1 1 auto;
+  min-width: 44px;
+  padding: 7px 0;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+
+.day:hover {
+  border-color: var(--text-3);
+}
+
+.dayOn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 700;
+}

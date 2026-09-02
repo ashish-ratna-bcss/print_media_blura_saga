@@ -33,7 +33,7 @@ export function Header({
           <Newspaper size={18} strokeWidth={2.25} />
         </div>
         <div className={styles.titles}>
-          <h1>Clipping Desk</h1>
+          <h1>epaper saga</h1>
           <div className={styles.sub}>newspaper page → separate articles</div>
         </div>
       </div>

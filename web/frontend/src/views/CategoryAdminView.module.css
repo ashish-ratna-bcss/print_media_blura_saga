@@ -1,0 +1,314 @@
+.stack {
+  display: grid;
+  gap: 16px;
+}
+
+.intro {
+  margin: 0;
+  max-width: 68ch;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+
+.mergeBar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+  align-items: flex-end;
+  padding: 13px 15px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.field {
+  display: grid;
+  gap: 5px;
+}
+
+.field label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+.field select {
+  min-width: 210px;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.input {
+  min-width: 240px;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.primary:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.ghost:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.table th,
+.table td {
+  padding: 9px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: middle;
+}
+
+.table th {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-3);
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.right {
+  text-align: right;
+}
+
+.name {
+  font-weight: 600;
+}
+
+.id {
+  display: block;
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.raw {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+/* Hidden topics stay listed. A row that vanished would look like a deletion,
+   and the point of hiding rather than deleting is that the decision survives
+   and can be undone. */
+.hiddenRow {
+  opacity: 0.5;
+}
+
+.err {
+  margin: 0;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: var(--bad);
+  background: var(--bad-soft);
+  border: 1px solid var(--bad);
+  border-radius: var(--radius-sm);
+}
+
+.note {
+  margin: 0;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: var(--good);
+  background: var(--good-soft);
+  border: 1px solid var(--good);
+  border-radius: var(--radius-sm);
+}
+
+/* -- the fixed scheme, for reference ------------------------------------- */
+
+.scheme {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.schemeHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 16px;
+  border: none;
+  background: var(--surface-2);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.schemeHead:hover {
+  background: var(--surface-hover);
+}
+
+.schemeTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.schemeToggle {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.schemeBody {
+  padding: 16px;
+  display: grid;
+  gap: 18px;
+}
+
+/* The bilingual answer, given prominence because it is the question people
+   actually ask about a Telugu/Hindi/English archive. */
+.langNote {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.langNote svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.group {
+  display: grid;
+  gap: 9px;
+}
+
+.groupName {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.headings {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
+  gap: 10px;
+}
+
+.heading,
+.headingDesk {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  min-width: 0;
+}
+
+/* The police headings carry a stripe rather than a different colour: they are
+   not more important, they are a different desk, and colouring them would
+   read as a status. */
+.headingDesk {
+  border-left: 3px solid var(--accent);
+}
+
+.heading strong,
+.headingDesk strong {
+  font-size: 13px;
+  text-transform: capitalize;
+}
+
+.headingNote {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+.headingKids {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.schemeFoot {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-3);
+  border-top: 1px solid var(--border-soft);
+  padding-top: 13px;
+}

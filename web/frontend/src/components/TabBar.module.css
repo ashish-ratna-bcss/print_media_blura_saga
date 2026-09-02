@@ -45,3 +45,25 @@
   border-radius: 999px;
   background: color-mix(in srgb, currentColor 18%, transparent);
 }
+
+/*
+ * On a narrow screen the strip is wider than the viewport, and an inline-flex
+ * simply hangs off the right edge taking the whole page with it. Scrolling
+ * the strip itself keeps every tab reachable and the page straight -- the
+ * alternative, wrapping, breaks the segmented look the control depends on.
+ */
+@media (max-width: 620px) {
+  .tabs {
+    display: flex;
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .tab {
+    flex: 0 0 auto;
+    padding: 8px 12px;
+  }
+}

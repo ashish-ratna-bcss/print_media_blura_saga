@@ -93,8 +93,13 @@ class Readwhere:
 
     def issue_for_date(self, title_id, date: str):
         """date as YYYY-MM-DD -> issue id, or None if that day wasn't published."""
+        if not date:
+            raise ValueError("issue_for_date needs a date as YYYY-MM-DD")
         for row in self.publish_dates(title_id):
-            if row.get("published", "").startswith(date):
+            # `or ""` rather than a get() default: the default only applies
+            # when the key is ABSENT, and a row carrying an explicit null
+            # published date would still reach startswith as None and raise.
+            if (row.get("published") or "").startswith(date):
                 return row["id"]
         return None
 

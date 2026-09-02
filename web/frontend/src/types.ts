@@ -75,7 +75,20 @@ export interface SearchHit {
   body: string;
   byline: string;
   lang: string;
+  /** What the story is ABOUT. Empty until the classifier has labelled it. */
   category: string;
+  /** The specific kind within that heading — "murder" under crime. Returned
+   *  by every hit builder; was missing here, so nothing rendered it. */
+  subcategory: string;
+  /** Where it BELONGS — the beat that claims it most strongly. */
+  primary_beat: string;
+  /** Specifics under the topic — the offence, the place, the organisation. */
+  tags: string[];
+  /**
+   * "human" when a person set the topic by hand. Bulk relabelling skips
+   * those, so a correction is not undone by the next overnight run.
+   */
+  category_source?: string;
   bbox: number[];
   crop: string | null;
   text_source: string;
@@ -105,7 +118,59 @@ export interface CorpusStats {
   earliest?: string | null;
   latest?: string | null;
   by_paper: { paper: string; n: number }[];
+  /** Articles per beat — geography and desk. */
   by_beat: { beat: string; n: number }[];
+  /** Articles per topic. Everything sits under "(unlabelled)" until the
+   *  classifier runs. */
+  by_category: { category: string; n: number }[];
+}
+
+/** One day the archive holds. `labelled` < `n` means classification is behind. */
+export interface ArchiveDate {
+  date: string;
+  n: number;
+  labelled: number;
+}
+
+/** What appeared on a day — the screen between picking a date and the clips. */
+export interface Facets {
+  date: string | null;
+  paper: string | null;
+  total: number;
+  /**
+   * Articles nobody has classified yet. Distinct from the "unclassified"
+   * category, which means the classifier ran and could not label them —
+   * a backlog and a quality problem are not the same thing.
+   */
+  unlabelled: number;
+  categories: { category: string; label: string; n: number }[];
+  tags: { tag: string; n: number }[];
+}
+
+/** Browse results — printed order, not ranked. Scores are always zero. */
+export interface BrowseResponse {
+  date: string | null;
+  category: string | null;
+  tag: string | null;
+  paper: string | null;
+  total: number;
+  page: number;
+  per_page: number;
+  pages: number;
+  results: SearchHit[];
+}
+
+/** A row in the topic registry, with its merge and visibility state. */
+export interface CategoryRow {
+  id: string;
+  label: string;
+  n: number;
+  /** Non-null when this entry has been merged away into another. */
+  merged_into: string | null;
+  hidden: boolean;
+  sample_raw: string;
+  /** "human" for a topic somebody added before the classifier produced it. */
+  created_by?: string;
 }
 
 export interface Expansion {
@@ -172,4 +237,90 @@ export interface ArticleRow {
 export interface JobDetail {
   job: JobRow;
   articles: ArticleRow[];
+}
+
+// -- daily collection -------------------------------------------------------
+
+/** A newspaper registered for unattended nightly collection. */
+export interface Source {
+  id: string;
+  host: string;
+  title_id: string;
+  paper: string;
+  edition: string;
+  lang: string;
+  /** 0 means the whole edition. Most publishers serve only page 1 free. */
+  max_pages: number;
+  enabled: boolean;
+  /** The last date collected, not a timestamp — that is what makes a repeated
+   *  run idempotent and a missed night recoverable. */
+  last_date: string;
+  last_error: string;
+  fail_count: number;
+}
+
+/**
+ * Whether the nightly run is registered with Windows Task Scheduler.
+ * Read from the OS rather than from a setting of our own, so it cannot claim
+ * "on" for a task that was deleted or never created on this machine.
+ */
+export interface ScheduleState {
+  supported: boolean;
+  registered: boolean;
+  status?: string;
+  next_run?: string;
+  last_run?: string;
+  last_result?: string;
+  detail?: string;
+}
+
+/**
+ * One paper's contribution to a day.
+ *
+ * "waiting" is a registered paper whose edition has not arrived yet, which
+ * before the morning run is normal rather than a failure.
+ */
+export interface DailySource {
+  source_id: string;
+  paper: string;
+  edition: string;
+  lang: string;
+  /** false for a one-off extraction the scheduler knows nothing about. */
+  registered: boolean;
+  n: number;
+  labelled: number;
+  pages: number[];
+  categories: string[];
+  status: "collected" | "waiting" | "failed";
+  last_date: string;
+  last_error: string;
+  fail_count: number;
+}
+
+export interface DailyReport {
+  date: string;
+  total: number;
+  collected: number;
+  waiting: number;
+  failed: number;
+  sources: DailySource[];
+  schedule: ScheduleState;
+}
+
+/** One of the fixed top-level headings, with what belongs under it. */
+export interface Heading {
+  id: string;
+  label: string;
+  note: string;
+  /** True for the five police-desk headings. */
+  desk: boolean;
+  /** Seeded subcategories only — not what the classifier has invented. */
+  children: string[];
+}
+
+export interface Headings {
+  headings: Heading[];
+  police_desk: string[];
+  unclassified: string;
+  language_note: string;
 }
