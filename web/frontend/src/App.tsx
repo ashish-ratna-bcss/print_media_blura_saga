@@ -1,29 +1,21 @@
-import {
-  Database,
-  FileText,
-  History as HistoryIcon,
-  Loader2,
-  Plus,
-  Search,
-} from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { CalendarDays, Plus, Sunrise, Tags } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import styles from "./App.module.css";
 import { Header } from "./components/Header";
 import { TabBar, type TabDef } from "./components/TabBar";
 import { useHealth } from "./hooks/useHealth";
 import { useJobPoll } from "./hooks/useJobPoll";
 import type { JobKind } from "./types";
-import { HistoryView } from "./views/HistoryView";
+import { BrowseView } from "./views/BrowseView";
+import { DailyReaderView } from "./views/DailyReaderView";
 import { NewExtractionView } from "./views/NewExtractionView";
-import { ResultView } from "./views/ResultView";
-import { SearchView } from "./views/SearchView";
-import { TopicSearchView } from "./views/TopicSearchView";
+import { CategoryAdminView } from "./views/CategoryAdminView";
 
 // "archive" is the UI's name for what the backend calls the corpus. The
 // distinction is deliberate: /api/corpus, epaper/corpus.py and the
 // epaper_corpus database keep the technical term, while the tab says the
 // thing a reader would say.
-type TabId = "new" | "topic" | "archive" | "result" | "history";
+type TabId = "new" | "daily" | "browse" | "categories";
 
 function TabPanel({ active, children }: { active: boolean; children: ReactNode }) {
   return (
@@ -39,33 +31,28 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>("new");
   const [pendingKind, setPendingKind] = useState<JobKind | null>(null);
 
-  useEffect(() => {
-    if (jobPoll.detail?.job.status === "done") {
-      setActiveTab("result");
-    }
-  }, [jobPoll.detail?.job.status]);
-
   function startJob(id: string, kind: JobKind) {
     setPendingKind(kind);
     jobPoll.watch(id);
   }
 
-  function openFromHistory(id: string) {
+  // Reopening a past run shows it where runs are shown now: inside New.
+  function openRun(id: string) {
     setPendingKind(null);
-    setActiveTab("result");
+    setActiveTab("new");
     jobPoll.watch(id);
   }
 
   const tabs: TabDef[] = [
     { id: "new", label: "New", icon: <Plus size={13} /> },
-    { id: "topic", label: "Topic search", icon: <Search size={13} /> },
-    { id: "archive", label: "Archive", icon: <Database size={13} /> },
-    {
-      id: "result",
-      label: "Result",
-      icon: jobPoll.active ? <Loader2 size={13} className="spin" /> : <FileText size={13} />,
-    },
-    { id: "history", label: "History", icon: <HistoryIcon size={13} /> },
+    // The papers that arrive without being asked for. Sits beside New
+    // because the two are the same act -- getting a paper in -- differing
+    // only in whether you have to be there when it happens.
+    { id: "daily", label: "Daily reader", icon: <Sunrise size={13} /> },
+    // Browse leads, because it is the journey most readers want: a date and a
+    // subject, not a query. Search is for when you already know the words.
+    { id: "browse", label: "Browse", icon: <CalendarDays size={13} /> },
+    { id: "categories", label: "Categories", icon: <Tags size={13} /> },
   ];
 
   const trackedJob = jobPoll.detail?.job ?? null;
@@ -78,33 +65,28 @@ export default function App() {
         <TabBar tabs={tabs} active={activeTab} onChange={(id) => setActiveTab(id as TabId)} />
       </div>
 
+      <TabPanel active={activeTab === "daily"}>
+        <DailyReaderView />
+      </TabPanel>
+
       <TabPanel active={activeTab === "new"}>
         <NewExtractionView
           onSubmitted={(id) => startJob(id, "page")}
           job={pendingKind === "page" ? trackedJob : null}
           polling={pendingKind === "page" && jobPoll.active}
+          detail={jobPoll.detail}
+          onOpen={openRun}
         />
       </TabPanel>
 
-      <TabPanel active={activeTab === "topic"}>
-        <TopicSearchView
-          onSubmitted={(id) => startJob(id, "topic")}
-          job={pendingKind === "topic" ? trackedJob : null}
-          polling={pendingKind === "topic" && jobPoll.active}
-        />
+      <TabPanel active={activeTab === "browse"}>
+        <BrowseView active={activeTab === "browse"} />
       </TabPanel>
 
-      <TabPanel active={activeTab === "archive"}>
-        <SearchView active={activeTab === "archive"} />
+      <TabPanel active={activeTab === "categories"}>
+        <CategoryAdminView active={activeTab === "categories"} />
       </TabPanel>
 
-      <TabPanel active={activeTab === "result"}>
-        <ResultView detail={jobPoll.detail} />
-      </TabPanel>
-
-      <TabPanel active={activeTab === "history"}>
-        <HistoryView active={activeTab === "history"} onOpen={openFromHistory} />
-      </TabPanel>
     </div>
   );
 }

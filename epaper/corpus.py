@@ -35,6 +35,18 @@ headline bonus and the region gate live. Mongo decides WHICH documents;
 keywords.py decides HOW WELL. Neither alone is enough -- textScore ranks a
 passing mention of "police" above an arrest story that never says the word.
 
+Two fields answer two different questions about an article, and they are not
+interchangeable:
+
+    primary_beat    WHERE it belongs -- the beat whose vocabulary claims it
+                    most strongly. Geography and desk. Computed here, free.
+    category        WHAT it is about -- the topical label. Assigned by the
+                    classifier, and empty until that stage runs.
+
+Both were once written under the name `category`, so a corpus of state-police
+beats answered every question about subject matter with "delhi-police". Keeping
+them apart is what makes browsing by topic possible at all.
+
 `full_text` exists so the text index has one field to weigh instead of two.
 It is headline + body concatenated at write time, which also means a phrase
 spanning the headline-to-body boundary is findable.
@@ -58,7 +70,8 @@ import re
 
 from pymongo import ASCENDING, DESCENDING, MongoClient, TEXT
 
-from . import config, keywords
+from . import catdata, categories, config, fragments, keywords
+from . import query as _query
 
 # Blend of the two rankers. Mongo knows which documents contain the words; the
 # beat vocabulary knows which of them are on the beat, and carries the region
@@ -127,6 +140,31 @@ class Corpus:
         self.articles.create_index([("page_id", ASCENDING)])
         self.articles.create_index([("keywords", ASCENDING)])
         self.articles.create_index([("category", ASCENDING)])
+        self.articles.create_index([("primary_beat", ASCENDING)])
+        # Multikey: one entry per tag per article. This is what makes
+        # narrowing a topic to a specific ("crime" -> "otp fraud") an index
+        # lookup rather than a scan of everything filed under the topic.
+        self.articles.create_index([("tags", ASCENDING)])
+        # The second level. Indexed on its own and beneath its parent, because
+        # both questions get asked: "every murder story" and "the murders
+        # inside today's crime".
+        self.articles.create_index([("subcategory", ASCENDING)])
+        self.articles.create_index([("category", ASCENDING),
+                                    ("subcategory", ASCENDING)])
+        # The browse path's only query: one day's articles, grouped by topic or
+        # filtered to one. Compound and in this order because `date` is always
+        # an equality match and `category` is either grouped or matched exactly,
+        # so Mongo can serve both the facet counts and the article list from
+        # this one index without touching a document.
+        self.articles.create_index([("date", DESCENDING), ("category", ASCENDING)])
+        # The second level. Stored on the article alongside its parent rather
+        # than resolved through the registry at query time: selecting "crime"
+        # has to match every story under it, and expanding a heading into its
+        # children on every request would turn one indexed equality into an
+        # $in over a list that changes as the tree grows.
+        self.articles.create_index([("subcategory", ASCENDING)])
+        self.articles.create_index([("date", DESCENDING),
+                                    ("subcategory", ASCENDING)])
         self.articles.create_index([("date", DESCENDING)])
         self.articles.create_index([("paper", ASCENDING), ("date", DESCENDING)])
         self.articles.create_index([("beats", ASCENDING), ("date", DESCENDING)])
@@ -245,6 +283,15 @@ class Corpus:
             if not headline and len(body) < 40:
                 counts["skipped"] += 1            # nothing worth indexing
                 continue
+            # The same test, for the case that one misses. A dateline BECOMES
+            # the block's headline, so it has one and passes the check above;
+            # this is what actually keeps "मुंबई, 16 अणस्त (एजेंसी)" out of
+            # the archive. Repeated here rather than trusted to the caller
+            # because every path into the corpus needs it -- the topic job and
+            # the SQLite backfill do not go through run_job.
+            if fragments.reason(a):
+                counts["skipped"] += 1
+                continue
 
             page_number = int(a.get("page_ref") or a.get("page_no")
                               or default_page or 0)
@@ -258,8 +305,24 @@ class Corpus:
             bbox = _as_list(a.get("bbox"))
             regions = _regions_of(a, bbox, headline)
             full_text = ("%s\n%s" % (headline, body)).strip()
-            hits, beats, beat_scores, category = beats_for({"headline": headline,
-                                                            "body": body})
+            hits, beats, beat_scores, primary_beat = beats_for(
+                {"headline": headline, "body": body})
+
+            # The label the classifier produced, filed under whatever it has
+            # been merged into. Two states are deliberately distinguishable:
+            # "" means nobody has classified this article yet, while
+            # catdata.UNKNOWN means the classifier ran and could not label it.
+            # Collapsing them would make a model outage indistinguishable from
+            # a backlog, and only one of those is fixed by waiting.
+            topic = (a.get("category") or "").strip()
+            if topic:
+                topic = categories.file_as(topic, a.get("raw_category") or "")
+            # The second level is recorded too, under its heading. Without
+            # this the registry only ever sees parents, `unplaced()` is
+            # permanently empty and there is nothing for assign_parents to
+            # place -- the counts that decide which labels deserve a decision
+            # are exactly the ones that would be missing.
+            sub = categories.file_child(a.get("subcategory") or "", topic)
 
             uid = uid_for(paper, date, page_number, headline, bbox)
             doc = {
@@ -282,7 +345,23 @@ class Corpus:
                 "headline": headline,
                 "body": body,
                 "full_text": full_text,
-                "category": category,
+                # WHERE the story belongs: the beat whose vocabulary claims it
+                # most strongly. Geography and desk, not subject matter.
+                "primary_beat": primary_beat,
+                # WHAT the story is about, as the classifier labelled it.
+                # These two lived under the name `category` at once, which is
+                # why a corpus full of police beats answered every question
+                # about topic with "delhi-police".
+                "category": topic,
+                "subcategory": catdata.normalise(a.get("subcategory")) or "",
+                # The specific kind within that heading -- "murder" under
+                # "crime". Free where `category` is controlled, which is the
+                # whole shape: a stable picker at the top, full coverage below.
+                "subcategory": sub,
+                # The classifier's own wording, before normalisation and
+                # aliasing. Kept so a bad alias can be told from a bad label.
+                "raw_category": a.get("raw_category") or "",
+                "tags": _as_tags(a.get("tags")),
                 "keywords": hits,
                 "beats": beats,
                 # Precomputed per-beat scores, so a beat query is an indexed
@@ -326,18 +405,38 @@ class Corpus:
     # -- read ------------------------------------------------------------
 
     def search(self, query: str, *, paper=None, date_from=None, date_to=None,
-               beat=None, category=None, limit: int = 50,
+               beat=None, category=None, subcategory=None, tag=None,
+               limit: int = 50, exclude=None, proximity=None, weekdays=None,
                min_score: float = 0.0, record: bool = True) -> dict:
-        """Hybrid retrieval over everything ever extracted. No model involved."""
+        """
+        Hybrid retrieval over everything ever extracted. No model involved.
+
+        `exclude`, `proximity` and `weekdays` narrow the result the way the
+        Topic Search form offers. Exclusions and weekdays are pushed into the
+        query so the database does the discarding; proximity is applied to the
+        rows that come back, because it depends on where words sit relative to
+        each other and there is no index that answers that.
+        """
         t0 = _dt.datetime.now()
         spec = keywords.expand(query)
+
+        drop = _query.parse_terms(exclude)
+        days = _query.parse_weekdays(weekdays)
+        window = _query.window_for(proximity)
+
         flt = {}
+        flt.update(_query.mongo_exclusion(drop))
+        flt.update(_query.mongo_weekdays(days))
         if paper:
             flt["paper"] = paper
         if beat:
             flt["beats"] = beat
         if category:
-            flt["category"] = category
+            # Normalised on the way in, so a reader arriving with the label as
+            # it is displayed ("Cybercrime") matches what is stored.
+            flt["category"] = catdata.normalise(category) or category
+        if tag:
+            flt["tags"] = catdata.normalise(tag) or tag
         if date_from or date_to:
             flt["date"] = {}
             if date_from:
@@ -353,6 +452,21 @@ class Corpus:
         # "delhi police" returned Delhi's articles and silently dropped
         # Jharkhand's.
         active = beat or spec["beat"]
+
+        def near_enough(row) -> bool:
+            """
+            Whether this row satisfies the proximity setting.
+
+            Measured against the query as the reader typed it, not against the
+            expanded vocabulary. Asking for "Delhi Police" within five words
+            is a statement about those two words; applying it to all 24 terms
+            the beat expands to would demand a coincidence nothing satisfies.
+            """
+            if window is None:
+                return True
+            text = row.get("full_text") or "%s %s" % (row.get("headline") or "",
+                                                      row.get("body") or "")
+            return _query.within(text, query, window)
 
         cap = max(limit * 4, 200)
         if active:
@@ -387,6 +501,8 @@ class Corpus:
                 else (spec.get("terms") or [])
             out = []
             for r in rows:
+                if not near_enough(r):
+                    continue
                 sc = (r.get("beat_scores") or {})
                 blended = sc.get(active)
                 if blended is None:
@@ -503,6 +619,8 @@ class Corpus:
         if rows:
             best = max((r.get("score") or 0) for r in rows) or 1.0
             for r in rows:
+                if not near_enough(r):
+                    continue
                 art = {"headline": r.get("headline", ""), "body": r.get("body", "")}
                 s = keywords.score(art, spec)
                 # The $in path yields no relevance number, so lexical strength
@@ -558,19 +676,111 @@ class Corpus:
         """
         n = changed = 0
         for r in self.articles.find({}, {"headline": 1, "body": 1, "beat_scores": 1,
-                                         "keywords": 1, "beats": 1, "category": 1}):
-            hits, beats, scores, category = beats_for(
+                                         "keywords": 1, "beats": 1,
+                                         "primary_beat": 1}):
+            hits, beats, scores, primary_beat = beats_for(
                 {"headline": r.get("headline", ""), "body": r.get("body", "")})
             n += 1
             if (r.get("beat_scores") == scores and r.get("keywords") == hits
-                    and r.get("beats") == beats):
+                    and r.get("beats") == beats
+                    and r.get("primary_beat") == primary_beat):
                 continue
+            # `category` is deliberately absent: it holds the topical label now,
+            # which no vocabulary change can affect. Rescoring must not touch it.
             self.articles.update_one(
                 {"_id": r["_id"]},
                 {"$set": {"keywords": hits, "beats": beats,
-                          "beat_scores": scores, "category": category}})
+                          "beat_scores": scores, "primary_beat": primary_beat}})
             changed += 1
         return {"scanned": n, "updated": changed}
+
+    def reclassify(self, *, only_unlabelled: bool = True, limit: int = 0,
+                   date=None, paper=None, batch: int = 25,
+                   progress=None) -> dict:
+        """
+        Assign topics to articles already in the archive.
+
+        Three jobs, one method. It fills in articles that were extracted before
+        the classifier existed; it re-labels everything after a prompt change;
+        and it is the repair when a model outage left a night's work blank.
+
+        `only_unlabelled=True` by default, because that is the cheap and
+        common case -- a full re-label of a large archive is minutes of GPU
+        time per thousand articles and should be asked for explicitly.
+
+        Imported here rather than at module scope: classify pulls in the model
+        client, and the corpus must stay importable on a machine with no model
+        server at all. Search, browse and ingest never reach this line.
+        """
+        from . import classify as _classify
+
+        flt = self._scope(date=date, paper=paper)
+        # A topic somebody set by hand is the last word. A bulk relabel that
+        # overwrote it would undo an afternoon of corrections on the next
+        # overnight run, and the person who made them would not find out until
+        # they went looking for an article they had already fixed.
+        flt["category_source"] = {"$ne": "human"}
+        if only_unlabelled:
+            # "" is never classified. catdata.UNKNOWN is classified and
+            # unlabelable, and is deliberately NOT included -- re-asking a
+            # model that already declined costs time and rarely changes.
+            flt["category"] = {"$in": ["", None]}
+
+        total = self.articles.count_documents(flt)
+        if limit:
+            total = min(total, int(limit))
+        done = {"scanned": 0, "labelled": 0, "failed": 0, "topics": {}}
+        if not total:
+            return done
+
+        cursor = self.articles.find(
+            flt, {"_id": 1, "headline": 1, "body": 1}).limit(int(limit) or 0)
+
+        # Batched so a long run writes as it goes. An interrupted reclassify
+        # then keeps everything it had already labelled instead of discarding
+        # an hour of GPU time, and re-running it resumes rather than restarts.
+        #
+        # Small on purpose, and it has to be smaller than any archive worth
+        # running this on. Set to 200 first, which meant a 127-article corpus
+        # accumulated one chunk, wrote nothing for twenty minutes and would
+        # have lost all of it on a Ctrl-C -- the exact failure the batching
+        # was added to prevent. A write every 25 costs one extra round trip
+        # per 25 articles against a stage that already spends ~90 s on them.
+        chunk = []
+        for row in cursor:
+            chunk.append(row)
+            if len(chunk) >= batch:
+                self._reclassify_chunk(chunk, done, _classify)
+                chunk = []
+                if progress:
+                    progress(done["scanned"], total)
+        if chunk:
+            self._reclassify_chunk(chunk, done, _classify)
+            if progress:
+                progress(done["scanned"], total)
+
+        done["topics"] = dict(sorted(done["topics"].items(),
+                                     key=lambda kv: -kv[1]))
+        return done
+
+    def _reclassify_chunk(self, rows, done, _classify):
+        for row, res in zip(rows, _classify.classify(rows)):
+            done["scanned"] += 1
+            topic = res["category"]
+            if res.get("classify_error"):
+                done["failed"] += 1
+            else:
+                done["labelled"] += 1
+            filed = categories.file_as(topic, res["raw_category"]) \
+                if topic else ""
+            done["topics"][filed or "(none)"] = \
+                done["topics"].get(filed or "(none)", 0) + 1
+            self.articles.update_one(
+                {"_id": row["_id"]},
+                {"$set": {"category": filed,
+                          "raw_category": res["raw_category"],
+                          "tags": res["tags"],
+                          "updated_at": _dt.datetime.now()}})
 
     def history_recent(self, limit: int = 30) -> list:
         rows = self.history.find({}, {"_id": 0}).sort("at", DESCENDING).limit(limit)
@@ -589,11 +799,297 @@ class Corpus:
         a["created_at"] = str(a.get("created_at") or "")
         return {"article": a, "page": _clean(pg), "epaper": _clean(ep)}
 
+    def set_topic(self, uid: str, *, category=None, tags=None) -> dict:
+        """
+        Correct one article's topic by hand. Returns the updated article.
+
+        A person overruling the classifier is the last word, and the stored
+        `category_source` says so. Everything that relabels in bulk --
+        reclassify after a prompt change, a re-ingest of the same page -- reads
+        that field and leaves human answers alone. Without it the first
+        overnight run would quietly undo an afternoon of corrections, and
+        nobody would notice until they went looking for an article they had
+        already fixed.
+
+        Passing `category=""` clears the label back to unclassified, which is
+        also a decision a person is allowed to make.
+        """
+        doc = self.articles.find_one({"uid": uid}, {"_id": 1})
+        if not doc:
+            raise KeyError(uid)
+
+        upd = {"updated_at": _dt.datetime.now()}
+        if category is not None:
+            label = (category or "").strip()
+            if label:
+                # Filed through the registry like any other label, so a
+                # hand-typed topic gets the same normalisation, the same merge
+                # redirects, and appears in the picker beside the rest.
+                filed = categories.file_as(label, label)
+                upd["category"] = filed
+                upd["raw_category"] = label
+                upd["category_source"] = "human"
+            else:
+                upd["category"] = ""
+                upd["raw_category"] = ""
+                upd["category_source"] = "human"
+        if tags is not None:
+            upd["tags"] = catdata.normalise_tags(tags)
+            upd["tags_source"] = "human"
+
+        self.articles.update_one({"_id": doc["_id"]}, {"$set": upd})
+        return self.article(uid)
+
     @staticmethod
     def _empty(query, spec):
         return {"query": query, "beat": spec["beat"], "expanded": spec["expanded"],
                 "terms": len(spec["terms"]), "scanned": 0, "total": 0,
                 "loose": False, "took_ms": 0.0, "results": []}
+
+    # -- browse ------------------------------------------------------------
+    #
+    # The reader path that is not a search. Someone reviewing yesterday does
+    # not have a query -- they have a date, and they want to be shown what
+    # subjects appeared before choosing one. Nothing here scores, expands or
+    # calls a model: every one of these is an indexed read, which is what the
+    # (date, category) compound index exists for.
+
+    @staticmethod
+    def _scope(date=None, paper=None, date_from=None, date_to=None) -> dict:
+        """The filter shared by facets, browse and dates. One definition, so a
+        facet count can never describe a different set than the list under it."""
+        flt = {}
+        if date:
+            flt["date"] = date
+        elif date_from or date_to:
+            flt["date"] = {}
+            if date_from:
+                flt["date"]["$gte"] = date_from
+            if date_to:
+                flt["date"]["$lte"] = date_to
+        if paper:
+            flt["paper"] = paper
+        return flt
+
+    def has_page(self, paper, date, page_number) -> bool:
+        """
+        Whether this page has already been extracted.
+
+        What makes a full-edition run resumable. Reading a page costs a minute
+        of GPU time, so a job that died on page 19 of 24 must not start again
+        at page 1 -- and a nightly schedule that fires twice must not pay for
+        the same edition twice.
+
+        Keyed on articles rather than the `pages` collection: a page row is
+        written before its articles are, so a crash between the two would look
+        like a finished page holding nothing.
+        """
+        return self.articles.count_documents(
+            {"paper": paper or "", "date": date or "",
+             "page_number": int(page_number or 0)}, limit=1) > 0
+
+    def facets(self, *, date=None, paper=None, date_from=None, date_to=None,
+               category=None, limit: int = 40, tag_limit: int = 25) -> dict:
+        """
+        Which categories appeared, and how many articles each holds.
+
+        The screen between picking a date and seeing the clips. Unlabelled
+        articles are reported under their own entry rather than dropped: a day
+        that has not been classified yet must look different from a day with
+        no crime in it, and silently omitting them makes those identical.
+
+        Passing `category` scopes the TAGS to that category while leaving the
+        category counts alone. That one difference is what turns a flat row of
+        keywords into a hierarchy: the tags inside "crime" are murder, robbery
+        and snatching, and they are exactly the sub-categories of crime. The
+        counts stay unscoped so the other categories remain selectable -- a
+        reader who picks crime has narrowed what they are looking at, not
+        thrown away the rest of the day.
+        """
+        flt = self._scope(date, paper, date_from, date_to)
+        cats = list(self.articles.aggregate([
+            {"$match": flt},
+            {"$group": {"_id": "$category", "n": {"$sum": 1}}},
+            {"$sort": {"n": -1}}, {"$limit": int(limit)}]))
+
+        scoped = dict(flt)
+        if category:
+            scoped["category"] = catdata.normalise(category) or category
+        tags = list(self.articles.aggregate([
+            {"$match": dict(scoped, tags={"$nin": [None, []]})},
+            {"$unwind": "$tags"},
+            {"$group": {"_id": "$tags", "n": {"$sum": 1}}},
+            {"$sort": {"n": -1}}, {"$limit": int(tag_limit)}]))
+
+        # The second level, counted per (parent, child) so a heading's chips
+        # and the articles behind them cannot disagree.
+        subs = list(self.articles.aggregate([
+            {"$match": dict(flt, subcategory={"$nin": ["", None]})},
+            {"$group": {"_id": {"c": "$category", "s": "$subcategory"},
+                        "n": {"$sum": 1}}},
+            {"$sort": {"n": -1}}]))
+        kids = {}
+        for x in subs:
+            kids.setdefault(x["_id"]["c"] or "", []).append(
+                {"subcategory": x["_id"]["s"],
+                 "label": catdata.display(x["_id"]["s"]), "n": x["n"]})
+
+        out, unlabelled = [], 0
+        for x in cats:
+            key = x["_id"] or ""
+            if not key:
+                unlabelled = x["n"]
+                continue
+            out.append({"category": key, "label": catdata.display(key),
+                        "n": x["n"], "children": kids.get(key, [])})
+        return {
+            "date": date, "paper": paper, "category": category,
+            "total": self.articles.count_documents(flt),
+            # Articles nobody has classified. Named separately from
+            # catdata.UNKNOWN, which means the classifier ran and failed --
+            # one is a backlog, the other is a quality problem.
+            "unlabelled": unlabelled,
+            "categories": out,
+            "tags": [{"tag": t["_id"], "n": t["n"]} for t in tags if t["_id"]],
+        }
+
+    def tree(self, *, date=None, paper=None, date_from=None, date_to=None,
+             limit: int = 30, sub_limit: int = 12, min_sub: int = 1) -> dict:
+        """
+        The two levels, in one call: headings with what sits under each.
+
+        Nothing declares this hierarchy. The classifier gives every article a
+        heading from a controlled list and a subcategory in its own words, so
+        the tree is a co-occurrence count over data that already exists and it
+        rebuilds itself every night. A subject the papers start covering shows
+        up the night it appears; one they stop covering fades out on its own.
+
+        A stored parent-child table would have to be written by somebody, kept
+        in step with a vocabulary that changes weekly, and would be wrong the
+        moment it was not -- which is exactly the maintenance burden the free
+        second level exists to avoid. Deriving it gets the same shape for free.
+
+        Articles with no subcategory are reported per heading as `direct`
+        rather than dropped. A heading whose children sum to less than its own
+        count is not a bug, and hiding the difference makes it look like one.
+        """
+        flt = self._scope(date, paper, date_from, date_to)
+        base = dict(flt, category={"$nin": ["", None]})
+
+        pairs = list(self.articles.aggregate([
+            {"$match": base},
+            {"$group": {"_id": {"c": "$category", "s": "$subcategory"},
+                        "n": {"$sum": 1}}},
+            {"$sort": {"n": -1}},
+        ]))
+        totals = {x["_id"]: x["n"] for x in self.articles.aggregate([
+            {"$match": base},
+            {"$group": {"_id": "$category", "n": {"$sum": 1}}}])}
+
+        cats = {}
+        for c, n in totals.items():
+            cats[c] = {"category": c, "label": catdata.display(c), "n": n,
+                       "direct": 0, "children": []}
+        for r in pairs:
+            c, sub = r["_id"]["c"], (r["_id"].get("s") or "")
+            node = cats.get(c)
+            if not node:
+                continue
+            if sub:
+                node["children"].append({"subcategory": sub,
+                                         "label": catdata.display(sub),
+                                         "n": r["n"]})
+            else:
+                # Filed under the heading with no specific kind named.
+                node["direct"] += r["n"]
+
+        out = sorted(cats.values(), key=lambda c: -c["n"])[:int(limit)]
+        for node in out:
+            kids = [k for k in node["children"] if k["n"] >= int(min_sub)]
+            node["children"] = sorted(kids, key=lambda k: -k["n"])[:int(sub_limit)]
+        return {"date": date, "paper": paper,
+                "parents": list(catdata.PARENTS), "categories": out}
+
+    def browse(self, *, date=None, category=None, subcategory=None,
+               paper=None, tag=None, date_from=None, date_to=None,
+               page: int = 1, per_page: int = 50) -> dict:
+        """
+        One day's articles, or one topic within it, in the order they were
+        printed. No query, no ranking, no model.
+
+        Sorted by page then by vertical position, which is reading order --
+        the order somebody turning the paper would meet them in. Sorting by
+        relevance here would be answering a question the reader did not ask.
+        """
+        flt = self._scope(date, paper, date_from, date_to)
+        if category:
+            flt["category"] = catdata.normalise(category) or category
+        if subcategory:
+            flt["subcategory"] = catdata.normalise(subcategory) or subcategory
+        if tag:
+            flt["tags"] = catdata.normalise(tag) or tag
+
+        per_page = max(1, min(int(per_page), 200))
+        page = max(1, int(page))
+        total = self.articles.count_documents(flt)
+        rows = list(self.articles.find(flt)
+                    .sort([("page_number", ASCENDING), ("bbox.1", ASCENDING)])
+                    .skip((page - 1) * per_page).limit(per_page))
+        return {
+            "date": date, "category": category, "subcategory": subcategory,
+            "tag": tag, "paper": paper, "total": total, "page": page, "per_page": per_page,
+            "pages": (total + per_page - 1) // per_page,
+            "results": [_plain_hit(r) for r in rows],
+        }
+
+    def dates(self, *, paper=None, limit: int = 120) -> list:
+        """
+        Which days the archive actually holds, newest first, with counts.
+
+        So the date picker can grey out days with nothing in them instead of
+        letting a reader select one and be shown an empty screen they cannot
+        distinguish from a failure.
+        """
+        flt = self._scope(paper=paper)
+        return [{"date": x["_id"], "n": x["n"], "labelled": x["labelled"]}
+                for x in self.articles.aggregate([
+                    {"$match": dict(flt, date={"$nin": ["", None]})},
+                    {"$group": {"_id": "$date", "n": {"$sum": 1},
+                                "labelled": {"$sum": {"$cond": [
+                                    {"$in": ["$category", ["", None]]}, 0, 1]}}}},
+                    {"$sort": {"_id": -1}}, {"$limit": int(limit)}])]
+
+    def by_paper(self, date: str) -> list:
+        """
+        One day's haul, split by title. What the Daily Reader lists.
+
+        The counts come from the articles themselves rather than from what the
+        collection run reported, because the two can disagree and only one of
+        them is what a reader can actually open: a run that fetched fourteen
+        pages and failed to read any of them is a success in the job log and an
+        empty day on the page.
+        """
+        rows = list(self.articles.aggregate([
+            {"$match": {"date": date}},
+            {"$group": {
+                "_id": {"paper": "$paper", "edition": "$edition"},
+                "n": {"$sum": 1},
+                "pages": {"$addToSet": "$page_number"},
+                "labelled": {"$sum": {"$cond": [
+                    {"$in": ["$category", ["", None, catdata.UNKNOWN]]}, 0, 1]}},
+                "categories": {"$addToSet": "$category"}}},
+            {"$sort": {"n": DESCENDING}}]))
+        out = []
+        for r in rows:
+            cats = sorted(c for c in (r.get("categories") or [])
+                          if c and c != catdata.UNKNOWN)
+            out.append({
+                "paper": r["_id"].get("paper") or "",
+                "edition": r["_id"].get("edition") or "",
+                "n": r["n"], "labelled": r["labelled"],
+                "pages": sorted(p for p in (r.get("pages") or []) if p),
+                "categories": cats[:8]})
+        return out
 
     def stats(self) -> dict:
         agg = lambda col, field: [                                # noqa: E731
@@ -609,7 +1105,13 @@ class Corpus:
             "searches": self.history.count_documents({}),
             "by_paper": [{"paper": x["key"], "n": x["n"]}
                          for x in agg(self.articles, "paper")],
-            "by_category": [{"category": x["key"] or "(none)", "n": x["n"]}
+            # Both are reported, because they answer different questions and
+            # the frontend has always asked for `by_beat`. It used to receive
+            # `by_category` holding beat ids under the wrong key, so the panel
+            # rendered nothing at all on the success path.
+            "by_beat": [{"beat": x["key"] or "(none)", "n": x["n"]}
+                        for x in agg(self.articles, "primary_beat")],
+            "by_category": [{"category": x["key"] or "(unlabelled)", "n": x["n"]}
                             for x in agg(self.articles, "category")],
             "earliest": (dates[0]["d0"] if dates else None),
             "latest": (dates[0]["d1"] if dates else None),
@@ -681,10 +1183,16 @@ def _clean(d):
             for k, v in d.items() if k != "epaper_id"}
 
 
-def _stored_hit(r, blended, beat_id):
-    """A hit built from precomputed fields -- no scoring work at query time."""
-    kws = r.get("keywords") or []
-    sc = r.get("beat_scores") or {}
+def _base_hit(r) -> dict:
+    """
+    The fields every result carries, however it was found.
+
+    One definition rather than three. The three builders below used to repeat
+    this block, and a field added to one and forgotten in another is exactly
+    how a result from the browse path ends up missing something the search
+    path returns -- the frontend then renders one and not the other, with
+    nothing in either to say why.
+    """
     return {
         "uid": r.get("uid"), "job_id": r.get("job_id"),
         "paper": r.get("paper"), "edition": r.get("edition"),
@@ -692,31 +1200,59 @@ def _stored_hit(r, blended, beat_id):
         "headline": r.get("headline", ""), "body": (r.get("body") or "")[:600],
         "byline": r.get("byline", ""), "lang": r.get("lang"),
         "category": r.get("category", ""),
+        "subcategory": r.get("subcategory", ""),
+        "primary_beat": r.get("primary_beat", ""),
+        "tags": r.get("tags") or [],
         "bbox": r.get("bbox") or [], "regions": r.get("regions") or [],
         "crop": r.get("crop"), "text_source": r.get("text_source"),
+    }
+
+
+def _stored_hit(r, blended, beat_id):
+    """A hit built from precomputed fields -- no scoring work at query time."""
+    kws = r.get("keywords") or []
+    sc = r.get("beat_scores") or {}
+    return dict(_base_hit(r), **{
         "score": blended,
         "lexical": round(min(1.0, len(kws) / 8.0), 3),
         "beat_score": blended, "keywords": kws[:12],
         "off_patch": bool(sc.get(beat_id + "__off")),
         "on_patch": bool(sc.get(beat_id + "__here")),
-    }
+    })
 
 
 def _hit(r, blended, lexs, s):
-    return {
-        "uid": r.get("uid"), "job_id": r.get("job_id"),
-        "paper": r.get("paper"), "edition": r.get("edition"),
-        "date": r.get("date"), "page_number": r.get("page_number"),
-        "headline": r.get("headline", ""), "body": (r.get("body") or "")[:600],
-        "byline": r.get("byline", ""), "lang": r.get("lang"),
-        "category": r.get("category", ""),
-        "bbox": r.get("bbox") or [], "regions": r.get("regions") or [],
-        "crop": r.get("crop"), "text_source": r.get("text_source"),
+    return dict(_base_hit(r), **{
         "score": blended, "lexical": round(lexs, 3),
         "beat_score": s["score"], "keywords": s["hits"][:12],
         "off_patch": s["off_patch"],
         "on_patch": bool(s.get("in_region")),
-    }
+    })
+
+
+def _plain_hit(r) -> dict:
+    """
+    A browse result. Nothing was ranked, so the scores are reported as zero
+    rather than omitted -- the reader is looking at a whole day's articles in
+    page order, and a score would be a number with no question behind it.
+    """
+    return dict(_base_hit(r), **{
+        "score": 0.0, "lexical": 0.0, "beat_score": 0.0,
+        "keywords": (r.get("keywords") or [])[:12],
+        "off_patch": False, "on_patch": False,
+    })
+
+
+def _as_tags(v) -> list:
+    """
+    The classifier's keyword list, cleaned again on the way in.
+
+    Re-normalised rather than trusted, because ingest is also reachable from
+    the backfill path, where the values came out of SQLite and were never
+    near catdata. Cheap, and it keeps one spelling rule over the whole
+    collection whatever route a document took to get here.
+    """
+    return catdata.normalise_tags(v)
 
 
 def _as_list(v):
@@ -837,7 +1373,9 @@ def beats_for(article: dict) -> tuple:
         # a placeless story does, however much policing vocabulary the latter
         # carries, and no weighting of the two on one scale expresses that.
         scores[beat_id + "__here"] = bool(s["in_region"])
-        # Which beat OWNS the article, for the `category` field. Previously the
+        # Which beat OWNS the article, for the `primary_beat` field. This used
+        # to be written as `category`, which made a geographic answer stand in
+        # for a topical one. Previously the
         # first beat that matched, which was fine with one beat and arbitrary
         # with 36 -- every placeless police story would have been filed under
         # whichever force happened to lead the table.

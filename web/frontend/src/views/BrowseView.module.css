@@ -1,0 +1,400 @@
+.stack {
+  display: grid;
+  gap: 16px;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: flex-end;
+}
+
+.field {
+  display: grid;
+  gap: 5px;
+}
+
+.field label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+.field select {
+  min-width: 220px;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* ---------------------------------------------------------- categories */
+
+.chipRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.chip:hover {
+  border-color: var(--accent);
+}
+
+.chipOn {
+  composes: chip;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+/* Articles the classifier could not label. Dashed and muted rather than
+   hidden: a day holding unlabelled articles must not look like a day that
+   simply had fewer of them. */
+.chipMuted {
+  composes: chip;
+  border-style: dashed;
+  color: var(--text-3);
+}
+
+.count {
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.chipOn .count {
+  color: inherit;
+}
+
+.label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------- results */
+
+.summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: center;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.results {
+  display: grid;
+  gap: 10px;
+}
+
+.hit {
+  display: grid;
+  gap: 7px;
+  padding: 13px 15px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.hitTop {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.page {
+  flex: none;
+  min-width: 34px;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.hl {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.35;
+  font-weight: 600;
+}
+
+.meta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.tag {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border-radius: 100px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.tag:hover {
+  border-color: var(--accent);
+}
+
+.tagOn {
+  composes: tag;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.crop {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+}
+
+/* -------------------------------------------------------------- pager */
+
+.pager {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  padding-top: 4px;
+}
+
+.pager button {
+  padding: 6px 13px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.pager button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.pageNo {
+  font-size: 12.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  min-width: 92px;
+  text-align: center;
+}
+
+.err {
+  padding: 9px 12px;
+  font-size: 13px;
+  color: var(--bad);
+  background: var(--bad-soft);
+  border: 1px solid var(--bad);
+  border-radius: var(--radius-sm);
+}
+
+/* -- category / topic switch --------------------------------------------- */
+
+.modeRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.modes {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.mode,
+.modeOn {
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 18px;
+  border: none;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-2);
+  transition: all var(--dur-fast) var(--ease);
+}
+
+.mode:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.modeOn {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.mode + .mode,
+.mode + .modeOn,
+.modeOn + .mode {
+  border-left: 1px solid var(--border);
+}
+
+.searchRow {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.searchRow input {
+  flex: 1 1 260px;
+  min-width: 0;
+  font: inherit;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.searchRow input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Relevance, shown because a ranked list without its ranking asks the reader
+   to trust an order they cannot see the reason for. */
+.score {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* -- which days ---------------------------------------------------------- */
+
+.spanRow {
+  display: flex;
+  align-items: flex-end;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.presets {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.preset,
+.presetOn {
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 15px;
+  border: none;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-2);
+  white-space: nowrap;
+  transition: all var(--dur-fast) var(--ease);
+}
+
+.preset:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.presetOn {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.preset + .preset,
+.preset + .presetOn,
+.presetOn + .preset {
+  border-left: 1px solid var(--border);
+}
+
+/* The clipping list. One column: a clipping is wide, and two of them side by
+   side halves the width of the thing the page exists to show. */
+.editRow {
+  margin-top: 4px;
+}
+
+/*
+ * Five presets in one segmented strip is wider than a phone. Wrapping is
+ * right here rather than scrolling: unlike the tab bar these are a small set
+ * of equal choices, and a reader should see all of them at once rather than
+ * discover the last two by dragging.
+ */
+@media (max-width: 620px) {
+  .spanRow {
+    align-items: stretch;
+  }
+  .presets {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  .preset,
+  .presetOn {
+    flex: 1 1 auto;
+    padding: 8px 12px;
+  }
+  /* A wrapped row leaves stray vertical rules at the start of each new line;
+     the outer border alone reads better than a broken grid of them. */
+  .preset + .preset,
+  .preset + .presetOn,
+  .presetOn + .preset {
+    border-left: none;
+  }
+}

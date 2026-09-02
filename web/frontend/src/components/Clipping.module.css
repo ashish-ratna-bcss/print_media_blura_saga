@@ -1,0 +1,298 @@
+/*
+ * A clipping card: the cut-out beside its transcription.
+ *
+ * Laid out like something pasted into a scrapbook rather than a search
+ * result -- the image on the left at a fixed column so a list of them aligns
+ * down the page, and the text set in a serif because that is what the
+ * original was set in and it reads as a newspaper rather than as a form.
+ */
+
+.clip {
+  display: grid;
+  grid-template-columns: 190px 1fr;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  transition: box-shadow var(--dur-fast) var(--ease);
+}
+
+.clip:hover {
+  box-shadow: var(--shadow-sm);
+}
+
+/* Below this the image on its own column is a thumbnail nobody can read, so
+   it goes full width above the text instead. */
+@media (max-width: 640px) {
+  .clip {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* -- the cut-out --------------------------------------------------------- */
+
+.shot {
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: zoom-in;
+  display: block;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  align-self: start;
+}
+
+.shot:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.img {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  /* Newsprint is off-white; a pure white ground behind a scanned crop makes
+     the paper look grey. */
+  background: #fbfaf7;
+}
+
+.img {
+  height: 210px;
+  object-fit: cover;
+  /* Anchor to the top: a clipping's headline is at its top edge, and
+     centring the crop hides exactly the part worth seeing in the list. */
+  object-position: top center;
+}
+
+/* -- the transcription --------------------------------------------------- */
+
+.text {
+  display: grid;
+  gap: 7px;
+  align-content: start;
+  min-width: 0;
+  /* OCR produces unbroken runs -- joined words, url-like strings -- that a
+     normal wrap will not break and which then widen the column past the
+     card. */
+  overflow-wrap: anywhere;
+}
+
+.headline {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 17px;
+  line-height: 1.28;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+  color: var(--text);
+}
+
+.slug {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.slug strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  /* Without this a grid child refuses to shrink below its content, so one
+     long badge pushes the whole row past the card instead of wrapping. */
+  min-width: 0;
+}
+
+.cat,
+.sub,
+.score {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/*
+ * The byline is the one field here whose length cannot be trusted.
+ *
+ * A real one is "TRIBUNE NEWS SERVICE" or a reporter's name. But the reader
+ * sometimes returns the opening of the story in that field instead -- the
+ * longest in the archive is 424 characters -- and with `white-space: nowrap`
+ * that ran off the right of the card and out of the page. Clamped to one
+ * line with an ellipsis, so a bad value is ugly in its own corner rather
+ * than destructive to the layout.
+ */
+.byline {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-3);
+  min-width: 0;
+  max-width: 42ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cat {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sub {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+.score {
+  margin-left: auto;
+  font-family: var(--mono);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.body {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  /* Newspaper measure. Long OCR lines running the full width of a wide screen
+     are the thing that makes an archive feel like a log file. */
+  max-width: 68ch;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 2px;
+}
+
+.tag,
+.tagOn {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+
+.tag:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.tagOn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* -- lightbox ------------------------------------------------------------ */
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4vh 4vw;
+  background: rgba(8, 10, 16, 0.82);
+  backdrop-filter: blur(3px);
+  animation: fade var(--dur) var(--ease);
+  cursor: zoom-out;
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+
+.frame {
+  margin: 0;
+  max-width: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  cursor: default;
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+}
+
+.frame img {
+  display: block;
+  /* Leave room for the caption strip, so a tall clipping never pushes it
+     off the bottom of the screen. */
+  max-height: calc(92vh - 74px);
+  max-width: 100%;
+  width: auto;
+  object-fit: contain;
+  background: #fbfaf7;
+}
+
+.frame figcaption {
+  display: grid;
+  gap: 2px;
+  padding: 11px 15px;
+  /* Fixed dark, not a token: this strip sits on the overlay in both themes,
+     so it must not follow the page's surface colour. */
+  background: #14171f;
+  color: #eaedf4;
+  font-size: 12.5px;
+}
+
+.frame figcaption strong {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.frame figcaption span {
+  color: #9ba3b8;
+}
+
+.close {
+  position: absolute;
+  top: 14px;
+  right: 18px;
+  width: 38px;
+  height: 38px;
+  font-size: 24px;
+  line-height: 1;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.close:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.close:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lightbox {
+    animation: none;
+  }
+}

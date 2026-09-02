@@ -61,9 +61,36 @@ degrades both.
 
 ## Usage
 
-```bash
-pip3 install -r requirements.txt          # Pillow, pymongo
+The app -- web UI, API and archive -- is one command. `run.ps1` on Windows,
+`run.sh` on Linux or in Git Bash; the subcommands are identical.
 
+```powershell
+.
+un.ps1 setup      # once: .venv, dependencies, .env
+.
+un.ps1            # http://127.0.0.1:8080
+```
+
+| command | what it does |
+|---|---|
+| *(none)* | rebuilds the frontend if any source under `web/frontend` is newer than the bundle, then serves the SPA and the API from one process on :8080 |
+| `dev` | Vite on :5173 with hot reload, backend on :8080 with `--reload`. **Open :5173** -- :8080 still serves the last build |
+| `build` | the frontend bundle only |
+| `setup` | `.venv`, `pip install -r requirements.txt`, `npm install`, and `.env` copied from `.env.example` |
+| `check` | `scripts/db_check.py` then `scripts/health.py`, and exits |
+
+Ports move with `-Port` / `-VitePort` in PowerShell and `PORT=` / `VITE_PORT=`
+in bash; `-Bind 0.0.0.0` (`BIND=`) accepts connections from other machines.
+`run.cmd` is a shim for cmd.exe, and for a PowerShell whose execution policy
+refuses a `.ps1` that arrived as a download.
+
+`setup` deliberately stops short of torch, the DocLayout weights and Ollama:
+several gigabytes, and only extraction needs them. The archive, the beats, the
+catalogue and topic search all run without them. See **Local backend** below.
+
+The pipeline scripts, for the work that happens outside the UI:
+
+```bash
 python3 scripts/discover.py               # probe every Delhi paper
 python3 scripts/discover.py tribune       # or filter by name
 
@@ -294,7 +321,7 @@ vocabulary, so it falls back to the `$text` index over `full_text`.
 curl 'localhost:8080/api/search?q=Delhi+Police&date_from=2026-08-01'
 curl 'localhost:8080/api/search?q=dimagi+naxal&paper=The+Tribune'
 curl localhost:8080/api/corpus                      # what is indexed
-curl -X POST localhost:8080/api/corpus/backfill     # index past SQLite jobs
+curl -X POST localhost:8080/api/corpus/backfill     # index past jobs
 curl -X POST localhost:8080/api/corpus/rescore      # after a vocabulary change
 ```
 
@@ -459,11 +486,99 @@ Per page it writes inspection artefacts to `out/debug/<Paper>/<date>/pNN/`:
 it raises, because a silent downgrade to whitespace cutting is exactly what
 produced the unusable draft clippings.
 
+## Browsing by day and topic
+
+Search answers "find me stories about X". Browse answers the other question --
+"what was in the paper yesterday" -- and it is the one most readers actually
+have. Every article is labelled at ingest, so the whole journey is indexed
+reads and returns in milliseconds:
+
+```
+GET /api/corpus/dates                       # days held, with counts
+GET /api/facets?date=2026-08-17             # topics that day, with counts
+GET /api/browse?date=2026-08-17&category=crime   # the clippings, printed order
+GET /api/browse?date=2026-08-17&tag=cybercrime   # narrowed by keyword
+```
+
+Topics are **not a fixed list.** A model reads each article and names the
+subject in its own words, so the list describes what the newspapers published
+rather than what somebody predicted. Two mechanisms keep that usable:
+
+- `epaper/catdata.py` folds away variants that carry no meaning -- case,
+  spacing, punctuation -- so "Cyber Crime", "cyber-crime" and "CYBERCRIME" are
+  one entry before anybody sees them. Hindi labels fold to their English
+  equivalents, or a bilingual corpus splits every subject in two.
+- `epaper/categories.py` is the review queue for what normalisation cannot
+  know. Where two entries are genuinely one subject, merging moves the articles
+  already filed *and* redirects future ones. Nothing is deleted, so the
+  decision stays visible and reversible.
+
+A person can also set an article's topic directly, from the Browse tab or
+`PATCH /api/article/{uid}`. That is marked as human and **survives every later
+bulk relabel** -- otherwise the next overnight run would quietly undo it.
+
+### Collecting every night
+
+```
+python scripts/daily.py --list          # registered titles, last collection
+python scripts/daily.py --dry-run       # what tonight would fetch
+python scripts/daily.py                 # collect today
+python scripts/daily.py --backfill 7    # the last week, oldest first
+```
+
+Titles come from the `sources` collection (`POST /api/sources`), not from
+arguments. The run is idempotent -- it asks "what have I not collected for this
+date", so firing twice costs two database reads and a missed night is still
+visible the next evening. One paper failing does not stop the others; the
+reason lands in `last_error` and `fail_count`.
+
+### Is the labelling any good?
+
+```
+python scripts/classify_check.py --stability 20   # consistency, no human input
+python scripts/classify_check.py --sample 60      # draw a set to grade by hand
+python scripts/classify_check.py --score sample.json
+```
+
+Run `--stability` first. It needs no human input and puts a ceiling on
+accuracy: a model that contradicts itself cannot be right. Measured at **95%**
+on `qwen2.5vl:3b`. Accuracy against human judgement is not yet measured.
+
+## Tests
+
+```
+pip install pytest && pytest
+```
+
+108 tests over label normalisation, classifier batching and alignment, the
+topic registry, the browse path, the source scheduler and the HTTP contract.
+They call no model and never touch the live corpus -- anything needing MongoDB
+gets a scratch database, and they skip cleanly when none is reachable. See
+`tests/README.md`, which also records two things the suite found out about the
+code that are worth knowing before writing more.
+
+The vision pipeline has no automated coverage; it needs page fixtures and a GPU.
+
 ## Data model
 
 MongoDB `epaper_corpus` database (`EPAPER_MONGO_DB`), collections
-`papers` / `pages` / `articles`. The field to trust when judging quality is
-`text_source`:
+`papers` / `pages` / `articles` / `categories` / `sources`.
+
+Two fields answer two different questions about an article and are **not**
+interchangeable:
+
+| field | question | set by |
+|---|---|---|
+| `category` | what it is ABOUT -- the topic | `epaper/classify.py`, or a person |
+| `primary_beat` | where it BELONGS -- geography and desk | `epaper/keywords.py`, free |
+
+Both were once written under the name `category`, so a corpus of state-police
+beats answered every question about subject matter with "delhi-police". An
+empty `category` means nobody has classified the article yet; `unclassified`
+means the classifier ran and could not label it -- a backlog and a quality
+problem are not the same thing, and only one is fixed by waiting.
+
+The field to trust when judging quality is `text_source`:
 
 | value | meaning |
 |---|---|

@@ -572,8 +572,14 @@ Return ONLY JSON:
  "byline":null,"dateline":null,"location":null,
  "body":"<every paragraph of the body text, blank line between paragraphs>",
  "photo_captions":[],"continued_on_page":null,
- "category":"politics|crime|business|sports|civic|health|education|world|entertainment|other",
  "transcription_confidence":0.0}"""
+
+# The topic label used to be asked for here, in the same breath as the
+# transcription. It is now epaper/classify.py's job, for two reasons. A model
+# transcribing and judging at once does both worse -- the field was answered
+# from the headline while the body was still being read. And the label was
+# thrown away anyway: Corpus.ingest overwrote it with a beat id, so every
+# transcription paid for an answer nothing ever read.
 
 
 # What the model returns when it describes the field instead of filling it.

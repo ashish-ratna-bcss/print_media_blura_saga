@@ -2,7 +2,7 @@ import { Database, MapPinOff, RefreshCw, Search } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { BeatPicker } from "../components/BeatPicker";
-import type { Beat, CorpusStats, SearchResponse } from "../types";
+import type { Beat, CategoryRow, CorpusStats, SearchResponse } from "../types";
 import styles from "./SearchView.module.css";
 
 /**
@@ -20,6 +20,8 @@ import styles from "./SearchView.module.css";
 export function SearchView({ active }: { active: boolean }) {
   const [q, setQ] = useState("");
   const [beat, setBeat] = useState("");
+  const [category, setCategory] = useState("");
+  const [cats, setCats] = useState<CategoryRow[]>([]);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [beats, setBeats] = useState<Beat[]>([]);
@@ -37,6 +39,10 @@ export function SearchView({ active }: { active: boolean }) {
     if (!active) return;
     loadStats();
     api.beats().then(setBeats).catch(() => setBeats([]));
+    api
+      .categories()
+      .then((r) => setCats(r.categories || []))
+      .catch(() => setCats([]));
   }, [active, loadStats]);
 
   async function run() {
@@ -48,6 +54,7 @@ export function SearchView({ active }: { active: boolean }) {
       const r = await api.search({
         q: q.trim(),
         beat: beat || undefined,
+        category: category || undefined,
         date_from: from || undefined,
         date_to: to || undefined,
         limit: 60,
@@ -105,6 +112,30 @@ export function SearchView({ active }: { active: boolean }) {
               showHint={false}
             />
           </div>
+          {cats.length > 0 && (
+            <div className={styles.narrow}>
+              <label className="field-label" htmlFor="corpus-category">
+                Category
+              </label>
+              {/*
+                Reads the category registry rather than the facet counts: this
+                search spans every date, so a list built from one day's
+                articles would omit categories the reader can legitimately search.
+              */}
+              <select
+                id="corpus-category"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+              >
+                <option value="">Any category</option>
+                {cats.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.label} ({c.n})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div className={styles.narrow}>
             <label className="field-label" htmlFor="corpus-from">
               From

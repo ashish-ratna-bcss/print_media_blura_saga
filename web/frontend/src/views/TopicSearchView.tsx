@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, Info, Search, Sparkles, Zap } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Info, Search, Sparkles, Zap } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { BeatPicker } from "../components/BeatPicker";
@@ -6,8 +6,28 @@ import { CatalogueFields } from "../components/CatalogueFields";
 import { bestEdition, catalogueGap, coverageWarning, editionMatch } from "../lib/coverage";
 import { ProgressPanel, type ProgressState } from "../components/ProgressPanel";
 import { useCatalogue } from "../hooks/useCatalogue";
+import type { Proximity, Timeframe } from "../api";
 import type { Beat, Expansion, JobRow, TopicMode } from "../types";
+
 import styles from "./TopicSearchView.module.css";
+
+const DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+
+const TIMEFRAMES: { id: Timeframe; label: string }[] = [
+  { id: "today", label: "Today" },
+  { id: "3d", label: "Past 3 days" },
+  { id: "week", label: "Past week" },
+  { id: "month", label: "Past month" },
+  { id: "custom", label: "Custom range" },
+  { id: "all", label: "Everything" },
+];
+
+const PROXIMITIES: { id: Proximity; label: string }[] = [
+  { id: "any", label: "Anywhere in the article" },
+  { id: "exact", label: "Exact phrase" },
+  { id: "w5", label: "Within 5 words" },
+  { id: "w10", label: "Within 10 words" },
+];
 
 const SUGGESTED_TOPICS = [
   "courts and judgments",
@@ -34,6 +54,18 @@ export function TopicSearchView({
   const [topic, setTopic] = useState("");
   const [maxPages, setMaxPages] = useState(2);
   const [mode, setMode] = useState<TopicMode>("hybrid");
+
+  // Refinements. `archive` is the one that changes what the others can do:
+  // fetching reads one date's pages, so a range is only meaningful against
+  // articles already stored.
+  const [archive, setArchive] = useState(false);
+  const [timeframe, setTimeframe] = useState<Timeframe>("today");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [days, setDays] = useState<string[]>([]);
+  const [exclude, setExclude] = useState("");
+  const [proximity, setProximity] = useState<Proximity>("any");
+  const [showSuggestions, setShowSuggestions] = useState(true);
   const [beats, setBeats] = useState<Beat[]>([]);
   const [expansion, setExpansion] = useState<Expansion | null>(null);
   const [showTerms, setShowTerms] = useState(false);
@@ -126,21 +158,33 @@ export function TopicSearchView({
   const canUseKeywords = !!expansion?.expanded;
   const effectiveMode: TopicMode = mode === "keywords" && !canUseKeywords ? "hybrid" : mode;
 
+  // An archive search fetches nothing, so it needs no publisher, edition or
+  // date — only a question. Demanding them would be asking the reader to name
+  // the page they want before searching for it.
   const canSearch =
-    !!(catalogue.host && catalogue.titleId && catalogue.date && topic.trim()) && !submitting;
+    !!topic.trim() &&
+    (archive || !!(catalogue.host && catalogue.titleId && catalogue.date)) &&
+    !submitting;
 
   async function search() {
     setSubmitError("");
     setSubmitting(true);
     try {
       const r = await api.topicSearch({
-        host: catalogue.host,
-        title_id: catalogue.titleId,
-        date: catalogue.date,
+        host: archive ? "" : catalogue.host,
+        title_id: archive ? "" : catalogue.titleId,
+        date: archive ? "" : catalogue.date,
         topic: topic.trim(),
-        edition: catalogue.edition?.name ?? "",
+        edition: archive ? "" : (catalogue.edition?.name ?? ""),
         max_pages: maxPages || 2,
         mode: effectiveMode,
+        scope: archive ? "archive" : "fetch",
+        timeframe: archive ? timeframe : undefined,
+        date_from: archive && timeframe === "custom" ? from : undefined,
+        date_to: archive && timeframe === "custom" ? to : undefined,
+        weekdays: archive && days.length ? days : undefined,
+        exclude: exclude.trim() || undefined,
+        proximity: proximity === "any" ? undefined : proximity,
       });
       onSubmitted(r.job_id);
     } catch (e) {
@@ -148,6 +192,10 @@ export function TopicSearchView({
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function toggleDay(d: string) {
+    setDays((cur) => (cur.includes(d) ? cur.filter((x) => x !== d) : [...cur, d]));
   }
 
   const note = !catalogue.host
@@ -229,6 +277,21 @@ export function TopicSearchView({
           </div>
         </div>
 
+        {/* Nothing here applies to an archive search: it reads no pages, so
+            there is no publisher to choose, no edition to fetch from and no
+            page budget to spend. Hidden rather than disabled — a row of dead
+            controls is worse than an absent one. */}
+        {archive ? (
+          <div className={`${styles.coverage} ${styles.coverageInfo}`}>
+            <Info size={14} />
+            <span>
+              Searching everything already extracted — no newspaper, edition or
+              page count needed. Untick <strong>Search only my saved archive</strong>{" "}
+              below to fetch new pages instead.
+            </span>
+          </div>
+        ) : (
+          <>
         <div className={styles.whereRow}>
           <span className={styles.stepLabel}>
             2 · Where to look
@@ -302,6 +365,9 @@ export function TopicSearchView({
           )
         )}
 
+          </>
+        )}
+
         <div style={{ marginTop: 16 }} className={styles.topicField}>
           {expansion && (
             <div className={styles.expansion}>
@@ -339,13 +405,173 @@ export function TopicSearchView({
             </div>
           )}
 
-          <div className={styles.chips}>
-            {SUGGESTED_TOPICS.map((t) => (
-              <button key={t} type="button" className={styles.chip} onClick={() => setTopic(t)}>
-                {t}
-              </button>
-            ))}
+          {/* Collapsible, because nine of these pushed everything below them
+              off the screen. They set the topic rather than filtering it, so
+              exactly one can be active — which is why this is a disclosure
+              with a count and not a Select all / Clear all pair. */}
+          <button
+            type="button"
+            className={styles.disclosure}
+            aria-expanded={showSuggestions}
+            aria-controls="topic-suggestions"
+            onClick={() => setShowSuggestions((v) => !v)}
+          >
+            <span className="field-label">Suggested topics</span>
+            <span className={styles.disclosureMeta}>
+              {SUGGESTED_TOPICS.length}
+              <ChevronDown
+                size={13}
+                className={showSuggestions ? styles.caretOpen : styles.caret}
+              />
+            </span>
+          </button>
+          {showSuggestions && (
+            <div className={styles.chips} id="topic-suggestions">
+              {SUGGESTED_TOPICS.map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  className={`${styles.chip} ${topic === t ? styles.chipOn : ""}`}
+                  aria-pressed={topic === t}
+                  onClick={() => setTopic(topic === t ? "" : t)}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ------------------------------------------------------ refine */}
+        <div className={styles.refine}>
+          <span className={styles.stepLabel}>3 · Refine</span>
+
+          <label className={styles.switch}>
+            <input
+              type="checkbox"
+              checked={archive}
+              onChange={(e) => setArchive(e.target.checked)}
+            />
+            <span>
+              <strong>Search only my saved archive</strong>
+              <span className={styles.switchHint}>
+                {archive
+                  ? "Answers from pages already read — milliseconds, and can span a date range."
+                  : "Fetches and reads the pages for one date. Minutes per page."}
+              </span>
+            </span>
+          </label>
+
+          <div className={styles.refineGrid}>
+            <div className={styles.topicField}>
+              <label className="field-label" htmlFor="topic-exclude">
+                Exclude
+              </label>
+              <input
+                id="topic-exclude"
+                type="text"
+                placeholder="traffic, parking"
+                value={exclude}
+                onChange={(e) => setExclude(e.target.value)}
+              />
+              <p className={styles.fieldHint}>
+                Comma separated. An article containing any of these is dropped.
+              </p>
+            </div>
+
+            <div className={styles.topicField}>
+              <label className="field-label" htmlFor="topic-prox">
+                Term proximity
+              </label>
+              <select
+                id="topic-prox"
+                value={proximity}
+                onChange={(e) => setProximity(e.target.value as Proximity)}
+              >
+                {PROXIMITIES.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+              <p className={styles.fieldHint}>
+                How close the words you typed must sit to each other.
+              </p>
+            </div>
           </div>
+
+          {/* Only meaningful against stored articles: fetching reads one
+              date's pages, so there is no range to range over. Hidden rather
+              than disabled — a control that can never apply here is noise. */}
+          {archive && (
+            <div className={styles.refineGrid}>
+              <div className={styles.topicField}>
+                <label className="field-label" htmlFor="topic-timeframe">
+                  Timeframe
+                </label>
+                <select
+                  id="topic-timeframe"
+                  value={timeframe}
+                  onChange={(e) => setTimeframe(e.target.value as Timeframe)}
+                >
+                  {TIMEFRAMES.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {timeframe === "custom" && (
+                <div className={styles.refineGrid}>
+                  <div className={styles.topicField}>
+                    <label className="field-label" htmlFor="topic-from">
+                      From
+                    </label>
+                    <input
+                      id="topic-from"
+                      type="date"
+                      value={from}
+                      onChange={(e) => setFrom(e.target.value)}
+                    />
+                  </div>
+                  <div className={styles.topicField}>
+                    <label className="field-label" htmlFor="topic-to">
+                      To
+                    </label>
+                    <input
+                      id="topic-to"
+                      type="date"
+                      value={to}
+                      onChange={(e) => setTo(e.target.value)}
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div className={styles.topicField}>
+                <span className="field-label">Days of the week</span>
+                <div className={styles.days} role="group" aria-label="Days of the week">
+                  {DAYS.map((d) => (
+                    <button
+                      key={d}
+                      type="button"
+                      className={`${styles.day} ${days.includes(d) ? styles.dayOn : ""}`}
+                      aria-pressed={days.includes(d)}
+                      onClick={() => toggleDay(d)}
+                    >
+                      {d[0].toUpperCase() + d.slice(1)}
+                    </button>
+                  ))}
+                </div>
+                <p className={styles.fieldHint}>
+                  {days.length === 0
+                    ? "Every day. Pick some to compare one weekday across the range."
+                    : `Only ${days.length} day${days.length === 1 ? "" : "s"} of the week.`}
+                </p>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className={styles.modeRow}>

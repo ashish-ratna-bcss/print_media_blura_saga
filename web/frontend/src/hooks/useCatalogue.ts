@@ -24,6 +24,22 @@ export function useCatalogue() {
 
   const [date, setDate] = useState("");
 
+  /**
+   * Language filter over the paper list. "" is every language.
+   *
+   * Held here rather than in the one view that uses it because it has to be
+   * able to clear the selected paper: choosing Telugu while an English title
+   * is selected would otherwise leave a paper picked that the list no longer
+   * offers, and the edition list below it would keep loading for it.
+   */
+  const [lang, setLangRaw] = useState("");
+
+  function setLang(next: string) {
+    setLangRaw(next);
+    const stillOffered = papers.find((p) => p.host === host && (!next || p.lang === next));
+    if (!stillOffered) setHost("");
+  }
+
   useEffect(() => {
     let alive = true;
     api
@@ -91,6 +107,8 @@ export function useCatalogue() {
     datesError,
     date,
     setDate,
+    lang,
+    setLang,
   };
 }
 

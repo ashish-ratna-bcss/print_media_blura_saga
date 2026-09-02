@@ -14,7 +14,7 @@ and the language model is never asked which text belongs to which headline.
 | **Association** | Deterministic geometry — no model       |
 | **API**         | FastAPI (Python 3.9)                     |
 | **UI**          | React 19 + TypeScript, Vite              |
-| **Store**       | SQLite + filesystem                      |
+| **Store**       | MongoDB + filesystem                     |
 | **Compute**     | Tesla T4                                 |
 
 ---
@@ -65,7 +65,7 @@ Two things distinguish this from the usual layout-plus-OCR design:
 ┌───────────────────────────────▼──────────────────────────────────────┐
 │  APPLICATION LAYER · FastAPI                                         │
 │                                                                      │
-│    REST API (11 routes) ──► Job Orchestrator ──► SQLite  jobs        │
+│    REST API (11 routes) ──► Job Orchestrator ──► MongoDB jobs        │
 │                                    │                     articles     │
 │                                    └──────────► File Store           │
 │                                                  page · overlay      │
@@ -124,7 +124,7 @@ flowchart TB
   subgraph APP["APPLICATION LAYER · FastAPI"]
     API["REST API<br/>11 routes"]
     ORCH["Job Orchestrator<br/><i>queued → running → done</i>"]
-    DB[("SQLite<br/>jobs · articles")]
+    DB[("MongoDB<br/>jobs · job_articles")]
     FS[("File Store<br/>page · overlay · crops")]
     API --> ORCH
     ORCH --> DB
@@ -200,7 +200,7 @@ flowchart TB
   └──────────┘  same    │        │         │          ├─────────────────────────┤
                 origin  │        ▼         │  POST    │  Ollama :11434          │
                         │  ┌──────────┐    │ ───────► │  qwen2.5vl:7b           │
-                        │  │  SQLite  │    │ /api/chat│                         │
+                        │  │ MongoDB  │    │ /api/chat│                         │
                         │  └──────────┘    │          └─────────────────────────┘
                         └──────────────────┘
                                               SSH port-forward
@@ -214,7 +214,7 @@ flowchart LR
   end
   subgraph M["APPLICATION HOST"]
     WEB["FastAPI :8080<br/>+ static frontend"]
-    SQL[("SQLite")]
+    SQL[("MongoDB")]
     WEB --- SQL
   end
   subgraph G["INFERENCE HOST · Tesla T4"]
@@ -256,7 +256,7 @@ concept of a newspaper, a job or an article.
 | 3 | Title anchoring  | boxes → article groups      | **Deterministic geometry**             | CPU           |
 | 4 | Region crop      | groups → article images     | Pillow, full resolution                      | CPU           |
 | 5 | Transcription    | crop → structured fields    | Qwen2.5-VL 7B                                | **GPU** |
-| 6 | Persistence      | fields → rows + files       | SQLite + filesystem                          | CPU           |
+| 6 | Persistence      | fields → documents + files  | MongoDB + filesystem                         | CPU           |
 
 ### Reading order
 
@@ -323,10 +323,14 @@ while a false positive costs one assess call. On any error the whole batch is ke
 two supplies **precision**, and is instructed that incidental mention of a topic does not
 make a story about it.
 
-> **Known architectural gap.** Stage one currently uses the LLM. It should be a **lexical +
-> vector prefilter** — query expansion (`police → FIR, constable, DSP, arrest`), BM25,
-> embedding similarity — with the LLM reserved for stage two. That removes the dominant
-> cost and the dependency on GPU availability.
+> **Largely superseded.** This describes topic search — a job that re-reads a page to
+> answer one question. Since classification moved to ingest (`epaper/classify.py`), the
+> same question is usually answered by an indexed read instead: `/api/browse` and
+> `/api/facets` return in milliseconds because the labelling was finished overnight.
+>
+> Topic search remains for the case browse cannot serve — a subject with no stored label,
+> asked of a page that has never been read. Its stage one still uses the LLM, and the
+> lexical prefilter in `epaper/keywords.py` already runs ahead of it.
 
 ---
 
@@ -350,7 +354,7 @@ make a story about it.
 | Priority | Change                                                            | Addresses                                                       |
 | -------- | ----------------------------------------------------------------- | --------------------------------------------------------------- |
 | 1        | PaddleOCR for Indic scripts, retaining layout-derived field roles | Telugu unreadable; Gujarati unverified — blocks a target state |
-| 2        | Lexical + vector prefilter ahead of LLM assess                    | Topic search latency and GPU contention                         |
+| 2        | Vector prefilter ahead of LLM assess                              | Topic search latency. Reduced in importance: browse now answers most of what topic search was used for |
 | 3        | Supervised process management for inference service + tunnel      | Manual startup; no restart on failure                           |
 | 4        | Fine-tune detector with`advertisement` and `byline` classes   | Bylines misclassified as titles; adverts inferred heuristically |
 | 5        | Platform branch in the page-fetch path                            | Publisher-JSON papers unavailable in page extraction            |
@@ -360,8 +364,18 @@ make a story about it.
 ## Validation status
 
 Verified on English and Hindi editions at 99% region coverage. Region coverage measures
-**segmentation**, not reading accuracy — the latter has not been measured on a
-statistically meaningful sample, and there is no automated test suite.
+**segmentation**, not reading accuracy — the latter has still not been measured on a
+statistically meaningful sample.
+
+**Automated tests** cover the classification and retrieval layers: 108 tests over label
+normalisation, classifier batching and alignment, the topic registry and its merges, the
+browse path, the source scheduler, and the HTTP contract. See `tests/README.md`. They call
+no model and never touch the live corpus, so they say nothing about label *quality* —
+that is measured separately by `scripts/classify_check.py`, which reports **95%
+self-consistency** on `qwen2.5vl:3b`. Accuracy against human judgement is still unmeasured.
+
+The vision pipeline itself (layout detection, association, transcription) has no automated
+coverage; it needs page fixtures and a GPU.
 
 See also: [HOW-IT-WORKS.md](HOW-IT-WORKS.md) for a plain-language explanation,
 [FUNCTIONALITY.md](FUNCTIONALITY.md) for the detailed reference, and

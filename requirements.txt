@@ -40,3 +40,15 @@ huggingface_hub>=0.20
 
 # The vision model is NOT a Python dependency -- it is a separate server.
 # See README "Local backend": ollama pull qwen2.5vl:7b (or :3b under ~4GB VRAM).
+
+# Tests (tests/, see tests/README.md). Not needed to run the app.
+#   pip install pytest && pytest
+# The suite calls no model and never touches the live corpus: anything needing
+# MongoDB gets a scratch database, and tests skip cleanly when none is
+# reachable, so it runs on a machine with neither a database nor a GPU.
+pytest>=8.0
+
+# Backup to S3 (scripts/backup.py). Optional: --engine python needs only
+# pymongo, which is already required, and --no-upload skips S3 entirely.
+# Install boto3 only if you are uploading:
+#   pip install boto3
