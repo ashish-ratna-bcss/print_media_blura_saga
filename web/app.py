@@ -55,6 +55,12 @@ for _stream in (sys.stdout, sys.stderr):
         pass                                  # already UTF-8, or not a tty
 
 from epaper import config as epaper_config     # noqa: E402
+
+# Before anything reads os.environ. A `.env` at the repo root is how the
+# database and LLM endpoint are configured; loading it after the first
+# getenv would be a race that works right up until it doesn't.
+epaper_config.load_env()
+
 from epaper import beats as beats_mod          # noqa: E402
 from epaper import catdata                        # noqa: E402
 from epaper import categories as cat_mod          # noqa: E402
@@ -64,11 +70,6 @@ from epaper import jobs as jobstore                # noqa: E402
 from epaper import query as epaper_query           # noqa: E402
 from epaper import sources as src_mod             # noqa: E402
 from epaper import corpus as corpus_mod, keywords, local_backend, topics, vlm  # noqa: E402
-
-# Before anything reads os.environ. A `.env` at the repo root is how the
-# database is configured; loading it after the first getenv would be a
-# race that works right up until it doesn't.
-epaper_config.load_env()
 
 # Where the active vocabulary came from. Set at startup, and again after any
 # edit. Reported by /api/beats/{id} so it is never a guess whether the running
@@ -372,7 +373,15 @@ def fetch_page_summit(host, edition_id, date, page_no, dest):
         raise RuntimeError("page %d carries no image url" % want)
     if not acq_download(url, dest):
         raise RuntimeError("page %d could not be downloaded" % want)
-    return dest
+    # Same shape as the Readwhere / LiveHindustan fetchers -- run_job reads
+    # title_name off this dict. Returning `dest` (a path string) used to
+    # crash: TypeError: string indices must be integers, not 'str'.
+    return {
+        "issue_id": str(edition_id),
+        "num_pages": len(pages),
+        "title_name": (pg.get("EditionName") or pg.get("PageName")
+                       or str(edition_id)),
+    }
 
 
 def fetch_page_lh(host, city, date, page_no, dest):
@@ -445,7 +454,11 @@ def run_job(jid, spec):
         else:
             info = fetch_page(spec["host"], spec["title_id"], spec["date"],
                               spec["page_no"], page)
-            set_job(jid, edition=info["title_name"] or spec.get("edition", ""))
+            # fetch_page* must return a dict; older Summit path returned a
+            # path string and crashed here on info["title_name"].
+            title = (info.get("title_name") if isinstance(info, dict) else "") or \
+                    spec.get("edition", "")
+            set_job(jid, edition=title)
 
         with Image.open(page) as im:
             W, H = im.size

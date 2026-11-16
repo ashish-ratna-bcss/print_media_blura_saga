@@ -16,6 +16,7 @@ Environment:
     EPAPER_VLM           model name/tag
     EPAPER_OLLAMA        http://localhost:11434
     EPAPER_VLLM          http://localhost:8000/v1
+    EPAPER_VLLM_API_KEY  optional Bearer token for the OpenAI-compatible endpoint
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ import urllib.request
 
 from PIL import Image
 
+from . import config as _config
+
+_config.load_env()
+
 BACKEND = os.environ.get("EPAPER_VLM_BACKEND", "ollama").lower()
 OLLAMA = os.environ.get("EPAPER_OLLAMA", "http://localhost:11434").rstrip("/")
 # Ollama's default context is 4096 tokens. A full-page image alone can exceed
@@ -37,6 +42,8 @@ OLLAMA = os.environ.get("EPAPER_OLLAMA", "http://localhost:11434").rstrip("/")
 # answers about a page it only half saw. Set it explicitly.
 NUM_CTX = int(os.environ.get("EPAPER_NUM_CTX", "16384"))
 VLLM = os.environ.get("EPAPER_VLLM", "http://localhost:8000/v1").rstrip("/")
+VLLM_API_KEY = (os.environ.get("EPAPER_VLLM_API_KEY")
+                or os.environ.get("LLM_API_KEY") or "").strip()
 
 _DEFAULT_MODEL = {"ollama": "qwen2.5vl:7b", "vllm": "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"}
 MODEL = os.environ.get("EPAPER_VLM", _DEFAULT_MODEL.get(BACKEND, "qwen2.5vl:7b"))
@@ -76,10 +83,19 @@ def encode(image, max_edge: int = 1400) -> str:
             im.close()
 
 
+def _headers(json_body: bool = True) -> dict:
+    h = {}
+    if json_body:
+        h["Content-Type"] = "application/json"
+    if BACKEND == "vllm" and VLLM_API_KEY:
+        h["Authorization"] = "Bearer " + VLLM_API_KEY
+    return h
+
+
 def _post(url: str, payload: dict, timeout: int) -> dict:
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"})
+        headers=_headers())
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "ignore"))
@@ -170,7 +186,7 @@ def _ollama_tags():
 
 
 def _vllm_models():
-    req = urllib.request.Request(VLLM + "/models")
+    req = urllib.request.Request(VLLM + "/models", headers=_headers(json_body=False))
     with urllib.request.urlopen(req, timeout=15) as r:
         return [m["id"] for m in json.loads(r.read().decode())["data"]]
 

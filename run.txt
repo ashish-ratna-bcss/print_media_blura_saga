@@ -1,0 +1,30 @@
+# E-Paper — run commands (macOS / Linux)
+
+# Once: create venv + install deps
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cd web/frontend && npm install && cd ../..
+
+# Build frontend
+cd web/frontend && npm run build && cd ../..
+
+# Start app (UI + API) → http://127.0.0.1:8080
+source .venv/bin/activate
+python web/app.py --port 8080 --host 127.0.0.1
+
+# Dev mode (two terminals)
+# Terminal 1 — backend
+source .venv/bin/activate
+python web/app.py --port 8080 --host 127.0.0.1 --reload
+
+# Terminal 2 — frontend → open http://127.0.0.1:5173
+cd web/frontend && npm run dev
+
+# Pre-flight checks
+source .venv/bin/activate
+python scripts/db_check.py
+python scripts/health.py
+
+# Custom port / bind
+python web/app.py --port 9000 --host 0.0.0.0
