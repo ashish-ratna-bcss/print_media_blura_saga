@@ -49,7 +49,7 @@ export function Dropzone({
           <UploadCloud size={20} strokeWidth={2} />
         </div>
         <p className={styles.big}>Drop a page here, or click to choose</p>
-        <p className={styles.hint}>JPG or PNG · PDF if poppler is installed</p>
+        <p className={styles.hint}>JPG, PNG, or PDF (PyMuPDF)</p>
         <input
           ref={inputRef}
           type="file"

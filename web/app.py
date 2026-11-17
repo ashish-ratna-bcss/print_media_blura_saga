@@ -5,7 +5,7 @@ E-Paper extraction web app.
     python3 web/app.py --port 8080
 
 Two ways in:
-  - upload a page (JPG/PNG, or PDF if pdftoppm is on PATH)
+  - upload a page (JPG/PNG, or PDF via PyMuPDF)
   - pick a newspaper, edition and date from the free Readwhere catalogue
 
 Both land in the same pipeline and the same history. Jobs run on a background
@@ -80,7 +80,7 @@ from epaper.platforms.livehindustan import LiveHindustan  # noqa: E402
 from epaper.platforms.summit import Summit        # noqa: E402
 from epaper.acquire import download as acq_download, stitch_tiles  # noqa: E402
 from epaper.platforms.readwhere import Readwhere  # noqa: E402
-from epaper.segment import crop_region           # noqa: E402
+from epaper.crop import crop_region              # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -114,6 +114,19 @@ async def lifespan(_app):
 
 app = FastAPI(title="E-Paper Extraction", lifespan=lifespan)
 _lock = threading.Lock()
+
+
+def _spawn(fn, *args, **kwargs):
+    """
+    Run heavy work on a real daemon thread.
+
+    FastAPI BackgroundTasks keep the worker busy until YOLO/VLM finish, which
+    freezes /api/jobs polling and health checks for minutes on CPU. A daemon
+    thread returns the job id immediately and lets the UI stay live.
+    """
+    t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
+    t.start()
+    return t
 
 # Two kinds of source, and the difference decides how good topic search can be.
 #   summit    - the publisher serves its own article text. No OCR, exact words,
@@ -278,19 +291,23 @@ def ingest_quietly(articles, **kw):
 # ---------------------------------------------------------------- pipeline
 
 def to_image(src_path, dest):
-    """Normalise an upload to a JPEG page. PDFs go through pdftoppm if present."""
+    """
+    Normalise an upload to a JPEG page.
+
+    PDFs: first page via PyMuPDF at 200 DPI → `page.jpg`. Optional text
+    sidecar `page_pdf_text.json` holds embedded spans in pixel coords.
+    Images: Pillow → RGB JPEG quality 92.
+    """
     if src_path.lower().endswith(".pdf"):
-        if not shutil.which("pdftoppm"):
-            raise RuntimeError("PDF upload needs poppler (pdftoppm) on PATH; "
-                               "upload a JPG or PNG instead")
-        out = os.path.join(os.path.dirname(dest), "pdfpage")
-        subprocess.run(["pdftoppm", "-jpeg", "-r", "200", "-f", "1", "-l", "1",
-                        src_path, out], check=True, capture_output=True)
-        made = [f for f in os.listdir(os.path.dirname(dest))
-                if f.startswith("pdfpage")]
-        if not made:
-            raise RuntimeError("could not render the PDF's first page")
-        os.replace(os.path.join(os.path.dirname(dest), made[0]), dest)
+        from epaper.pdf_render import PDFRenderError, pdf_first_page_to_jpeg
+        side = os.path.join(os.path.dirname(dest), "page_pdf_text.json")
+        embeds = os.path.join(os.path.dirname(dest), "pdf_embeds")
+        try:
+            pdf_first_page_to_jpeg(
+                src_path, dest, dpi=200,
+                text_sidecar=side, embeds_dir=embeds)
+        except PDFRenderError as ex:
+            raise RuntimeError(str(ex)) from ex
         return dest
     with Image.open(src_path) as im:
         im.convert("RGB").save(dest, "JPEG", quality=92)
@@ -482,7 +499,10 @@ def run_job(jid, spec):
                          "bbox": r["bbox_px"], "crop": name,
                          "region_boxes": r.get("region_boxes") or [],
                          "n_elements": len(r.get("elements") or []),
-                         "has_photo": bool(r.get("has_photo"))})
+                         "has_photo": bool(r.get("has_photo")),
+                         "ocr_error": r.get("ocr_error"),
+                         "ocr_backend": r.get("ocr_backend"),
+                         "extraction_status": r.get("extraction_status") or "ok"})
 
         if spec.get("with_text"):
             total = sum(1 for a in arts if a["type"] == "article")
@@ -498,8 +518,14 @@ def run_job(jid, spec):
                               "byline": f.get("byline") or "",
                               "dateline": f.get("dateline") or "",
                               "headline": f.get("headline") or a["headline"]})
+                    if f.get("_partial"):
+                        a["extraction_status"] = "partial"
                 except Exception as ex:
-                    a["body"] = "[read failed: %s]" % str(ex)[:120]
+                    # Keep body empty so fragments/classify do not treat the
+                    # error string as a real article.
+                    a["body"] = ""
+                    a["extraction_status"] = "failed"
+                    a["ocr_error"] = ("vlm: %s" % str(ex)[:160])
 
             # Datelines, bylines and OCR noise look like articles all the way
             # to here -- they have a box and some text. Marking them now, once
@@ -541,7 +567,11 @@ def run_job(jid, spec):
              "category": a.get("category", ""),
              "bbox": json.dumps(a["bbox"]), "crop": a["crop"],
              "n_elements": a["n_elements"],
-             "has_photo": int(a["has_photo"])} for a in arts])
+             "has_photo": int(a["has_photo"]),
+             "ocr_error": a.get("ocr_error") or "",
+             "ocr_backend": a.get("ocr_backend") or "",
+             "extraction_status": a.get("extraction_status") or "ok"}
+            for a in arts])
         # encoding="utf-8" is not optional here, and its absence was fatal.
         # Python's open() defaults to the locale encoding, which on Windows is
         # cp1252 -- so `ensure_ascii=False`, added precisely so Devanagari
@@ -1170,11 +1200,23 @@ def run_topic_job(jid, spec):
 @app.get("/api/health")
 def health():
     h = local_backend.health()
-    return {"ready": h.get("ready"), "gpu": h.get("gpu"),
-            "layout": h.get("weights_present"), "mode": h.get("mode"),
-            "vlm": h.get("vlm", {}).get("model"),
-            "vlm_ok": h.get("vlm", {}).get("available"),
-            "detail": h.get("vlm", {}).get("error") or h.get("layout_error") or ""}
+    ocr_h = h.get("ocr") or {}
+    vlm_h = h.get("vlm") or {}
+    return {
+        "ready": h.get("ready"),
+        "gpu": h.get("gpu"),
+        "device": h.get("device"),
+        "layout": h.get("weights_present"),
+        "layout_ok": bool(h.get("weights_present") and h.get("doclayout_yolo")),
+        "mode": h.get("mode"),
+        "vlm": vlm_h.get("model"),
+        "vlm_ok": bool(vlm_h.get("available")),
+        "ocr_ok": bool(ocr_h.get("available")),
+        "ocr": ocr_h.get("endpoint") or ocr_h.get("backend"),
+        "ocr_error": ocr_h.get("error") or "",
+        "detail": (vlm_h.get("error") or h.get("layout_error")
+                   or ocr_h.get("error") or ""),
+    }
 
 
 @app.get("/api/papers")
@@ -1421,10 +1463,10 @@ async def upload(background: BackgroundTasks, file: UploadFile = File(...),
     tmp = os.path.join(job_dir(jid), "src_" + (file.filename or "page"))
     with open(tmp, "wb") as f:
         f.write(await file.read())
-    background.add_task(run_job, jid, {"source": "upload", "tmp": tmp,
-                                       "paper": file.filename or "upload",
-                                       "page_no": 1,
-                                       "with_text": with_text == "1"})
+    _spawn(run_job, jid, {"source": "upload", "tmp": tmp,
+                          "paper": file.filename or "upload",
+                          "page_no": 1,
+                          "with_text": with_text == "1"})
     return {"job_id": jid}
 
 
@@ -1438,9 +1480,9 @@ def fetch(background: BackgroundTasks, payload: dict):
     page_no = int(payload.get("page_no") or 1)
     jid = _create({"source": "catalogue"}, paper, payload.get("edition", ""),
                   payload["date"], page_no, bool(payload.get("with_text")))
-    background.add_task(run_job, jid, {"source": "catalogue", **payload,
-                                       "paper": paper, "page_no": page_no,
-                                       "with_text": bool(payload.get("with_text"))})
+    _spawn(run_job, jid, {"source": "catalogue", **payload,
+                          "paper": paper, "page_no": page_no,
+                          "with_text": bool(payload.get("with_text"))})
     return {"job_id": jid}
 
 
@@ -1463,7 +1505,7 @@ def ingest_edition(background: BackgroundTasks, payload: dict):
     jid = _create({"source": "ingest"}, paper, payload.get("edition", ""),
                   payload["date"], 0, True)
     set_job(jid, kind="edition")
-    background.add_task(run_ingest_job, jid, {
+    _spawn(run_ingest_job, jid, {
         "source": "ingest", "host": payload["host"],
         "title_id": payload["title_id"], "date": payload["date"],
         "paper": paper, "edition": payload.get("edition", ""),
@@ -1591,7 +1633,7 @@ def daily_collect(background: BackgroundTasks, date: str = None):
     if not due:
         return {"started": False, "date": day, "due": 0,
                 "detail": "every enabled paper already has %s" % day}
-    background.add_task(_collect_due, day)
+    _spawn(_collect_due, day)
     return {"started": True, "date": day, "due": len(due),
             "papers": [r.get("paper") for r in due]}
 
@@ -1838,7 +1880,7 @@ def topic_job(background: BackgroundTasks, payload: dict):
         # latency that is not there.
         run_topic_job(jid, job_spec)
     else:
-        background.add_task(run_topic_job, jid, job_spec)
+        _spawn(run_topic_job, jid, job_spec)
     return {"job_id": jid, "platform": plat,
             "mode": "archive" if archive else mode,
             "beat": kw["beat"], "n_terms": len(kw["terms"])}
@@ -2440,16 +2482,43 @@ def on_error(request, exc):
 FRONTEND_DIST = os.path.join(HERE, "frontend", "dist")
 
 if os.path.isdir(FRONTEND_DIST):
+    # Never cache the SPA shell — otherwise a rebuild looks like "pages don't
+    # change" because the browser keeps serving yesterday's index.html.
+    @app.get("/")
+    def spa_index():
+        return FileResponse(
+            os.path.join(FRONTEND_DIST, "index.html"),
+            media_type="text/html",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+
     app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
 else:
     @app.get("/", response_class=HTMLResponse)
     def frontend_missing():
         return HTMLResponse(
-            "<pre>frontend not built.\n\n"
-            "  cd web/frontend\n"
-            "  npm install\n"
-            "  npm run build\n\n"
-            "then restart this server.</pre>",
+            """<!doctype html><html><head><meta charset="utf-8">
+<title>E-Paper — build frontend</title>
+<style>
+ body{margin:0;min-height:100vh;display:grid;place-items:center;
+  font:15px/1.5 system-ui,sans-serif;background:#ebe6dc;color:#1a1814}
+ .box{max-width:420px;padding:28px 30px;background:#faf8f4;border:1px solid #d2cbbd;
+  border-radius:14px;box-shadow:0 8px 24px -12px rgba(0,0,0,.18)}
+ h1{font-size:1.35rem;margin:0 0 8px}
+ p{margin:0 0 14px;color:#5c574e}
+ code{display:block;background:#f1ece3;padding:12px 14px;border-radius:8px;
+  font:13px/1.55 ui-monospace,Menlo,monospace;white-space:pre}
+</style></head><body><div class="box">
+<h1>Frontend not built</h1>
+<p>The UI bundle is missing. Build it, then restart the server.</p>
+<code>cd web/frontend
+npm install
+npm run build</code>
+</div></body></html>""",
             status_code=503)
 
 

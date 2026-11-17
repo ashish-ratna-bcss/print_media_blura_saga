@@ -25,14 +25,18 @@ export interface HealthStatus {
   ready: boolean;
   gpu: string | null;
   layout: boolean;
+  layout_ok?: boolean;
   mode: string | null;
   vlm: string | null;
   vlm_ok: boolean;
+  ocr_ok?: boolean;
+  ocr?: string | null;
+  ocr_error?: string;
   detail: string;
 }
 
 export type JobStatus = "queued" | "running" | "done" | "error";
-export type JobKind = "page" | "topic";
+export type JobKind = "page" | "upload" | "edition" | "topic";
 
 /** Relevance engine. "hybrid" = keywords then model; "keywords" = lexical only. */
 export type TopicMode = "hybrid" | "keywords";

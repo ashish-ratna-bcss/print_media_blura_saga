@@ -33,8 +33,8 @@ export function Header({
           <Newspaper size={18} strokeWidth={2.25} />
         </div>
         <div className={styles.titles}>
-          <h1>epaper saga</h1>
-          <div className={styles.sub}>newspaper page → separate articles</div>
+          <h1>E-Paper</h1>
+          <div className={styles.sub}>Layout · OCR · article extraction</div>
         </div>
       </div>
       <StatusDot state={state}>{label}</StatusDot>

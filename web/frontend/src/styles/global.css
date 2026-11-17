@@ -14,7 +14,11 @@ body,
 
 body {
   margin: 0;
-  background: var(--ground);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, color-mix(in srgb, var(--ground-2) 80%, transparent), transparent 50%),
+    var(--ground);
+  background-attachment: fixed;
   color: var(--text);
   font-family: var(--sans);
   font-size: 15px;
@@ -130,12 +134,13 @@ a {
 }
 
 .btn-primary {
-  background: linear-gradient(155deg, var(--accent), var(--accent-2));
+  background: var(--accent);
   color: var(--accent-ink);
-  box-shadow: 0 6px 18px -6px color-mix(in srgb, var(--accent) 55%, transparent);
+  box-shadow: var(--shadow-sm);
 }
 .btn-primary:hover:not(:disabled) {
-  box-shadow: 0 8px 22px -6px color-mix(in srgb, var(--accent) 65%, transparent);
+  background: var(--accent-2);
+  box-shadow: var(--shadow);
   transform: translateY(-1px);
 }
 

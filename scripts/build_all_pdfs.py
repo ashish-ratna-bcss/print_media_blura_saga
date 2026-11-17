@@ -2,18 +2,10 @@
 """
 Build one PDF per newspaper covering EVERY downloaded page.
 
-Structure follows the printed paper: full page, then the clippings cut from
-that page, then the next page.
+Uses DocLayout-YOLO + Shapely grouping (+ optional Qwen2.5-VL) only.
 
-    python3 scripts/build_all_pdfs.py                 # every paper, every page
+    python3 scripts/build_all_pdfs.py
     python3 scripts/build_all_pdfs.py --paper jansatta --max-pages 4
-
-Region source per page, in order of preference:
-  1. a hand-checked / VLM regions file in out/  (detector: vlm|manual)
-  2. the geometric detector in epaper.autosegment (detector: geometric)
-
-Geometric regions are DRAFT. They are marked as such on every clipping caption
-so nobody mistakes them for verified output.
 """
 import argparse
 import glob
@@ -24,8 +16,8 @@ import sys
 from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from epaper import autosegment  # noqa: E402
-from epaper.segment import crop_region  # noqa: E402
+from epaper import local_backend  # noqa: E402
+from epaper.crop import crop_region  # noqa: E402
 from epaper.store import Store, article_id  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -37,7 +29,8 @@ def manual_regions_for(paper, page_no):
     """Pick up a hand-checked layout file if one exists for this page."""
     for f in glob.glob(os.path.join(ROOT, "out", "regions_*.json")):
         try:
-            b = json.load(open(f, encoding="utf-8"))
+            with open(f, encoding="utf-8") as fh:
+                b = json.load(fh)
         except Exception:
             continue
         if b.get("paper") == paper and int(b.get("page", -1)) == int(page_no):
@@ -63,9 +56,6 @@ def main():
     ap.add_argument("--no-clips", action="store_true", help="full pages only")
     ap.add_argument("--no-text", action="store_true",
                     help="group and crop, but skip VLM transcription")
-    ap.add_argument("--backend", default="geometric",
-                    choices=["geometric", "local", "claude"],
-                    help="local = DocLayout-YOLO + self-hosted Qwen2.5-VL")
     args = ap.parse_args()
 
     store = Store()
@@ -73,19 +63,14 @@ def main():
         print("! mongodb unreachable")
         return 1
 
-    detector = autosegment
-    if args.backend == "local":
-        from epaper import local_backend
-        h = local_backend.health()
-        if not h["ready"]:
-            print("! local backend not ready. Run scripts/health.py for detail:")
-            print(json.dumps(h, indent=1))
-            return 2
-        print("local backend ready: %s | %s @ %s\n"
-              % (os.path.basename(h["weights_path"]), h["vlm"]["model"], h["gpu"]))
-        detector = local_backend
-    elif args.backend == "claude":
-        from epaper import segment as detector  # noqa: F401
+    h = local_backend.health()
+    if not h.get("ready"):
+        print("! local backend not ready. Run scripts/health.py for detail:")
+        print(json.dumps(h, indent=1))
+        return 2
+    print("backend ready: %s | %s\n"
+          % (os.path.basename(h.get("weights_path") or ""),
+             (h.get("vlm") or {}).get("model")))
 
     papers = sorted({d["paper"] for d in store.db.pages.find({}, {"paper": 1})})
     if args.paper:
@@ -106,7 +91,7 @@ def main():
         doc = Doc(paper, "%s  |  %d pages  |  Delhi" % (date, len(pages)))
         doc.masthead()
 
-        n_clip = n_draft = 0
+        n_clip = 0
         for pi, pg in enumerate(pages, 1):
             path = pg["image_path"]
             if not os.path.exists(path):
@@ -127,27 +112,21 @@ def main():
             regions = manual_regions_for(paper, pg["page_no"])
             src = "manual"
             if regions is None:
-                if args.backend == "local":
-                    regions = detector.detect_regions(
-                        path, pg["page_no"], paper=paper, date=pg["date"])
-                else:
-                    regions = detector.detect_regions(path, pg["page_no"])
-                src = args.backend
+                regions = local_backend.detect_regions(
+                    path, pg["page_no"], paper=paper, date=pg["date"])
+                src = "local"
             regions = attach_px(regions, size)
             arts = [r for r in regions if r.get("type") == "article"]
 
-            # Each detector writes to its own directory. The geometric run's
-            # 697 draft crops are never read back or reused.
             page_articles = []
             crops_dir = os.path.join(os.path.dirname(path),
-                                     "articles" if src in ("geometric", "manual")
-                                     else "articles_" + args.backend)
+                                     "articles" if src == "manual" else "articles_local")
             placed = 0
             for ai, r in enumerate(arts, 1):
                 crop = os.path.join(
                     crops_dir, "p%s_a%02d.jpg" % (str(pg["page_no"]).zfill(2), ai))
                 try:
-                    crop_region(path, r["bbox_px"], crop)   # always re-cut
+                    crop_region(path, r["bbox_px"], crop)
                 except Exception:
                     continue
                 with Image.open(crop) as ci:
@@ -161,9 +140,8 @@ def main():
                 if r.get("continued_on_page"):
                     bits.append("continued on page %s" % r["continued_on_page"])
                 bits.append("%d x %d px" % (cw, ch))
-                bits.append({"geometric": "DRAFT geometric detector",
-                             "local": "DocLayout-YOLO + Qwen2.5-VL",
-                             "manual": "verified layout"}.get(src, "verified layout"))
+                bits.append({"local": "DocLayout-YOLO + Shapely + IndicOCR + Qwen2.5-VL",
+                             "manual": "verified layout"}.get(src, "local"))
                 hl = r.get("headline_visible", "")
                 primary = hl if ascii_ok(hl) else "Clipping %02d" % ai
 
@@ -189,26 +167,25 @@ def main():
                     "grouping_confidence": r.get("grouping_confidence"),
                     "text_source": "layout-only", "detector": r.get("detector", src),
                 }
-                if args.backend == "local" and not args.no_text:
+                if not args.no_text:
                     try:
-                        fields = detector.transcribe(crop)
+                        fields = local_backend.transcribe(crop)
                         rec.update(fields)
-                        rec["text_source"] = "vlm-local"
+                        rec["text_source"] = "vlm"
                     except Exception as ex:
                         rec["transcribe_error"] = str(ex)[:200]
                         print("      ! read failed on a%02d: %s" % (ai, str(ex)[:90]),
                               flush=True)
                 store.save_article(rec)
                 page_articles.append(rec)
-            if args.backend == "local" and page_articles:
-                dd = detector.debug_dir_for(paper, pg["date"], pg["page_no"])
+            if page_articles:
+                dd = local_backend.debug_dir_for(paper, pg["date"], pg["page_no"])
                 os.makedirs(dd, exist_ok=True)
                 with open(os.path.join(dd, "articles.json"), "w",
                           encoding="utf-8") as fh:
                     json.dump(page_articles, fh, ensure_ascii=False,
                               indent=1, default=str)
             n_clip += placed
-            n_draft += placed if src == "geometric" else 0
             store.db.pages.update_one({"_id": pg["_id"]}, {"$set": {"segmented": True}})
             print("  %-18s p%-3s %2d clippings (%s)  [%d/%d]"
                   % (paper[:18], pg["page_no"], placed, src, pi, len(pages)), flush=True)
@@ -216,8 +193,8 @@ def main():
 
         dest = os.path.join(OUTDIR, "%s %s.pdf" % (paper, date))
         npdf = doc.save(dest)
-        print("  -> %-38s %3d pdf pages, %3d clippings (%d draft), %.1f MB\n"
-              % (os.path.basename(dest), npdf, n_clip, n_draft,
+        print("  -> %-38s %3d pdf pages, %3d clippings, %.1f MB\n"
+              % (os.path.basename(dest), npdf, n_clip,
                  os.path.getsize(dest) / 1e6), flush=True)
 
     print("folder:", OUTDIR)

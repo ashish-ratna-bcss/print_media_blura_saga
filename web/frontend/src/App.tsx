@@ -1,92 +1,215 @@
-import { CalendarDays, Plus, Sunrise, Tags } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import {
+  CalendarDays,
+  House,
+  Newspaper,
+  ScanSearch,
+  Tags,
+} from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import styles from "./App.module.css";
-import { Header } from "./components/Header";
-import { TabBar, type TabDef } from "./components/TabBar";
+import { LiveStatusBar } from "./components/LiveStatusBar";
 import { useHealth } from "./hooks/useHealth";
 import { useJobPoll } from "./hooks/useJobPoll";
-import type { JobKind } from "./types";
 import { BrowseView } from "./views/BrowseView";
-import { DailyReaderView } from "./views/DailyReaderView";
-import { NewExtractionView } from "./views/NewExtractionView";
 import { CategoryAdminView } from "./views/CategoryAdminView";
+import { DailyReaderView } from "./views/DailyReaderView";
+import { HomeView } from "./views/HomeView";
+import { NewExtractionView } from "./views/NewExtractionView";
 
-// "archive" is the UI's name for what the backend calls the corpus. The
-// distinction is deliberate: /api/corpus, epaper/corpus.py and the
-// epaper_corpus database keep the technical term, while the tab says the
-// thing a reader would say.
-type TabId = "new" | "daily" | "browse" | "categories";
+type TabId = "home" | "extract" | "daily" | "browse" | "categories";
 
-function TabPanel({ active, children }: { active: boolean; children: ReactNode }) {
-  return (
-    <section hidden={!active} className={active ? styles.panelActive : styles.panel}>
-      {children}
-    </section>
-  );
+const NAV: { id: TabId; label: string; hint: string; icon: ReactNode }[] = [
+  { id: "home", label: "Home", hint: "What you can do", icon: <House size={18} /> },
+  {
+    id: "extract",
+    label: "Extract",
+    hint: "Fetch or upload a page",
+    icon: <ScanSearch size={18} />,
+  },
+  {
+    id: "daily",
+    label: "Daily",
+    hint: "Today’s papers",
+    icon: <Newspaper size={18} />,
+  },
+  {
+    id: "browse",
+    label: "Browse",
+    hint: "Search the archive",
+    icon: <CalendarDays size={18} />,
+  },
+  {
+    id: "categories",
+    label: "Categories",
+    hint: "Labels & merges",
+    icon: <Tags size={18} />,
+  },
+];
+
+const TAB_IDS = new Set<string>(NAV.map((n) => n.id));
+
+function tabFromHash(): TabId {
+  const raw = (window.location.hash || "").replace(/^#/, "");
+  return TAB_IDS.has(raw) ? (raw as TabId) : "home";
 }
 
 export default function App() {
-  const { health, checking, unreachable } = useHealth();
-  const jobPoll = useJobPoll();
-  const [activeTab, setActiveTab] = useState<TabId>("new");
-  const [pendingKind, setPendingKind] = useState<JobKind | null>(null);
+  const { health, checking, unreachable } = useHealth(15000);
+  const jobPoll = useJobPoll(1200);
+  const [tab, setTab] = useState<TabId>(() =>
+    typeof window !== "undefined" ? tabFromHash() : "home",
+  );
+  const [submitError, setSubmitError] = useState("");
+  const [statusDismissed, setStatusDismissed] = useState(false);
 
-  function startJob(id: string, kind: JobKind) {
-    setPendingKind(kind);
+  useEffect(() => {
+    const onHash = () => setTab(tabFromHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  function go(id: TabId) {
+    setTab(id);
+    if (window.location.hash !== `#${id}`) {
+      window.location.hash = id;
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function startJob(id: string) {
+    setSubmitError("");
+    setStatusDismissed(false);
+    go("extract");
     jobPoll.watch(id);
   }
 
-  // Reopening a past run shows it where runs are shown now: inside New.
   function openRun(id: string) {
-    setPendingKind(null);
-    setActiveTab("new");
+    setSubmitError("");
+    setStatusDismissed(false);
+    go("extract");
     jobPoll.watch(id);
   }
 
-  const tabs: TabDef[] = [
-    { id: "new", label: "New", icon: <Plus size={13} /> },
-    // The papers that arrive without being asked for. Sits beside New
-    // because the two are the same act -- getting a paper in -- differing
-    // only in whether you have to be there when it happens.
-    { id: "daily", label: "Daily reader", icon: <Sunrise size={13} /> },
-    // Browse leads, because it is the journey most readers want: a date and a
-    // subject, not a query. Search is for when you already know the words.
-    { id: "browse", label: "Browse", icon: <CalendarDays size={13} /> },
-    { id: "categories", label: "Categories", icon: <Tags size={13} /> },
-  ];
+  const job = jobPoll.detail?.job ?? null;
+  const showStatus =
+    !statusDismissed &&
+    (jobPoll.active || !!job || !!submitError);
 
-  const trackedJob = jobPoll.detail?.job ?? null;
+  const healthLabel = checking
+    ? "Checking services…"
+    : unreachable
+      ? "Backend unreachable"
+      : health?.ready
+        ? "Pipeline ready"
+        : health?.detail || "Not ready";
 
   return (
-    <div className={styles.page}>
-      <Header health={health} checking={checking} unreachable={unreachable} />
+    <div className={styles.shell}>
+      <aside className={styles.sidebar}>
+        <div className={styles.brand}>
+          <div className={styles.mark}>E</div>
+          <div>
+            <div className={styles.brandName}>E-Paper</div>
+            <div className={styles.brandSub}>Article extraction</div>
+          </div>
+        </div>
 
-      <div className={styles.tabRow}>
-        <TabBar tabs={tabs} active={activeTab} onChange={(id) => setActiveTab(id as TabId)} />
-      </div>
+        <nav className={styles.nav} aria-label="Main">
+          {NAV.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={tab === item.id ? styles.navOn : styles.navBtn}
+              aria-current={tab === item.id ? "page" : undefined}
+              onClick={() => go(item.id)}
+            >
+              <span className={styles.navIcon}>{item.icon}</span>
+              <span className={styles.navText}>
+                <span className={styles.navLabel}>{item.label}</span>
+                <span className={styles.navHint}>{item.hint}</span>
+              </span>
+            </button>
+          ))}
+        </nav>
 
-      <TabPanel active={activeTab === "daily"}>
-        <DailyReaderView />
-      </TabPanel>
+        <div className={styles.services}>
+          <div className={styles.servicesTitle}>Services</div>
+          <ServiceRow
+            label="YOLO layout"
+            ok={!unreachable && !!health?.layout_ok}
+            checking={checking}
+          />
+          <ServiceRow
+            label="IndicOCR"
+            ok={!unreachable && !!health?.ocr_ok}
+            checking={checking}
+          />
+          <ServiceRow
+            label="Qwen VL"
+            ok={!unreachable && !!health?.vlm_ok}
+            checking={checking}
+          />
+          <p className={styles.healthNote}>{healthLabel}</p>
+        </div>
+      </aside>
 
-      <TabPanel active={activeTab === "new"}>
-        <NewExtractionView
-          onSubmitted={(id) => startJob(id, "page")}
-          job={pendingKind === "page" ? trackedJob : null}
-          polling={pendingKind === "page" && jobPoll.active}
-          detail={jobPoll.detail}
-          onOpen={openRun}
-        />
-      </TabPanel>
+      <main className={styles.main} key={tab}>
+        {showStatus && (
+          <LiveStatusBar
+            job={job}
+            active={jobPoll.active}
+            error={submitError || undefined}
+            onDismiss={
+              jobPoll.active
+                ? undefined
+                : () => {
+                    setStatusDismissed(true);
+                    setSubmitError("");
+                  }
+            }
+          />
+        )}
 
-      <TabPanel active={activeTab === "browse"}>
-        <BrowseView active={activeTab === "browse"} />
-      </TabPanel>
+        {tab === "home" && <HomeView onGo={go} />}
 
-      <TabPanel active={activeTab === "categories"}>
-        <CategoryAdminView active={activeTab === "categories"} />
-      </TabPanel>
+        {tab === "extract" && (
+          <NewExtractionView
+            onSubmitted={startJob}
+            onSubmitError={(msg) => {
+              setSubmitError(msg);
+              setStatusDismissed(false);
+            }}
+            job={job}
+            polling={jobPoll.active}
+            detail={jobPoll.detail}
+            onOpen={openRun}
+          />
+        )}
 
+        {tab === "daily" && <DailyReaderView />}
+
+        {tab === "browse" && <BrowseView active />}
+
+        {tab === "categories" && <CategoryAdminView active />}
+      </main>
+    </div>
+  );
+}
+
+function ServiceRow({
+  label,
+  ok,
+  checking,
+}: {
+  label: string;
+  ok: boolean;
+  checking: boolean;
+}) {
+  const state = checking ? "checking" : ok ? "ok" : "bad";
+  return (
+    <div className={styles.svc}>
+      <span className={`${styles.dot} ${styles[`dot_${state}`]}`} />
+      <span>{label}</span>
     </div>
   );
 }

@@ -21,6 +21,13 @@ python web/app.py --port 8080 --host 127.0.0.1 --reload
 # Terminal 2 — frontend → open http://127.0.0.1:5173
 cd web/frontend && npm run dev
 
+# IndicOCR tunnel (if Mac → :8000 is FortiGuard-blocked)
+# Needs SSH host "tenantsaga" in ~/Desktop/ssh/config
+ssh -f -N -L 18000:127.0.0.1:8000 tenantsaga
+# .env: EPAPER_INDICOCR_URL=http://127.0.0.1:18000
+curl -sS http://127.0.0.1:18000/health
+python scripts/test_indic_ocr.py
+
 # Pre-flight checks
 source .venv/bin/activate
 python scripts/db_check.py

@@ -120,13 +120,22 @@ def chat(prompt: str, img_b64: str, max_tokens: int = 4000, timeout: int = 600) 
         return (out.get("message") or {}).get("content", "")
 
     if BACKEND == "vllm":
-        out = _post(VLLM + "/chat/completions", {
-            "model": MODEL, "max_tokens": max_tokens, "temperature": 0,
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url",
-                 "image_url": {"url": "data:image/jpeg;base64," + img_b64}},
-                {"type": "text", "text": prompt}]}],
-        }, timeout)
+        messages = [{"role": "user", "content": [
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64," + img_b64}},
+            {"type": "text", "text": prompt}]}]
+        payload = {"model": MODEL, "max_tokens": max_tokens, "temperature": 0,
+                   "messages": messages}
+        # Prefer JSON mode when the server supports it; fall back if rejected.
+        try:
+            out = _post(VLLM + "/chat/completions",
+                        {**payload, "response_format": {"type": "json_object"}},
+                        timeout)
+        except VLMError as ex:
+            if "response_format" in str(ex).lower() or "400" in str(ex):
+                out = _post(VLLM + "/chat/completions", payload, timeout)
+            else:
+                raise
         return out["choices"][0]["message"]["content"]
 
     raise VLMError("unknown EPAPER_VLM_BACKEND=%r (use ollama or vllm)" % BACKEND)
@@ -154,21 +163,78 @@ def text_json(prompt: str, max_tokens: int = 2000, timeout: int = 300):
     return parse_json(chat_text(prompt, max_tokens, timeout))
 
 
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    t = re.sub(r"^```(?:json|JSON)?\s*", "", t)
+    t = re.sub(r"\s*```\s*$", "", t)
+    return t.strip()
+
+
+def _salvage_partial_json(text: str) -> dict | None:
+    """
+    Recover fields from a truncated JSON object (common when max_tokens cuts
+    mid-response). Keeps complete values, and unfinished headline/body strings.
+    """
+    m = re.search(r"\{", text)
+    if not m:
+        return None
+    chunk = text[m.start():]
+    out = {}
+    for key, val in re.findall(
+            r'"([^"\\]+)"\s*:\s*("(?:[^"\\]|\\.)*"|null|true|false|-?\d+(?:\.\d+)?)',
+            chunk):
+        if val == "null":
+            out[key] = None
+        elif val == "true":
+            out[key] = True
+        elif val == "false":
+            out[key] = False
+        elif val.startswith('"'):
+            try:
+                out[key] = json.loads(val)
+            except Exception:
+                out[key] = val[1:-1]
+        else:
+            try:
+                out[key] = float(val) if "." in val else int(val)
+            except Exception:
+                continue
+    # Truncated mid-string: "body": "lorem ipsum dolor  <EOF>
+    for key in ("headline", "body", "summary"):
+        if key in out:
+            continue
+        m2 = re.search(r'"%s"\s*:\s*"(.*)$' % re.escape(key), chunk, re.S)
+        if m2:
+            frag = m2.group(1)
+            # Drop a trailing incomplete escape if present.
+            frag = re.sub(r"\\$", "", frag).replace('\\"', '"').replace("\\n", "\n")
+            if frag.strip():
+                out[key] = frag.strip()
+    if out.get("headline") or out.get("body"):
+        out["_partial"] = True
+        return out
+    return None
+
+
 def parse_json(text: str):
-    """Tolerate fences and leading prose around the JSON body."""
+    """Tolerate fences, leading prose, and truncated JSON bodies."""
     if not text or not text.strip():
         raise VLMError("model returned an empty response")
-    t = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+    t = _strip_fences(text)
     try:
         return json.loads(t)
     except Exception:
-        m = re.search(r"[\{\[].*[\}\]]", t, re.S)
-        if not m:
-            raise VLMError("model did not return JSON: %r" % text[:300])
+        pass
+    m = re.search(r"[\{\[].*[\}\]]", t, re.S)
+    if m:
         try:
             return json.loads(m.group(0))
-        except Exception as ex:
-            raise VLMError("model returned malformed JSON (%s): %r" % (ex, text[:300]))
+        except Exception:
+            pass
+    partial = _salvage_partial_json(t)
+    if partial is not None:
+        return partial
+    raise VLMError("model did not return JSON: %r" % text[:300])
 
 
 def chat_json(prompt: str, image, max_edge: int = 1400,

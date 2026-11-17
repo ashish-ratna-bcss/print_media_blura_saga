@@ -42,7 +42,7 @@ import urllib.request
 
 from PIL import Image, ImageDraw
 
-from . import ocr, vlm
+from . import geometry, ocr, vlm
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -110,18 +110,23 @@ def _remote_elements(page_path: str, conf: float) -> list:
 
 def _default_device() -> str:
     """
-    Prefer the GPU, but fall back to CPU instead of raising.
+    Prefer a GPU accelerator, but fall back to CPU instead of raising.
 
-    This is not the kind of fallback the module refuses elsewhere. Downgrading
-    the *detector* changes the answer and is banned; downgrading the *device*
-    only changes how long the same answer takes. A CPU-only torch build is a
-    legitimate install -- DocLayout-YOLO is small enough to run on one, and on
-    a 4GB card it is arguably the better split, since it leaves the whole GPU
-    to the VLM. Force either way with EPAPER_DEVICE=cpu|cuda:0.
+    Order: CUDA → Apple MPS → CPU. Downgrading the *detector* changes the
+    answer and is banned; downgrading the *device* only changes how long the
+    same answer takes. On a MacBook without CUDA, MPS is the difference
+    between a few seconds and several minutes for DocLayout-YOLO.
+
+    Force either way with EPAPER_DEVICE=cpu|cuda:0|mps.
     """
     try:
         import torch
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            return "cuda:0"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+        return "cpu"
     except Exception:
         return "cpu"
 
@@ -165,85 +170,135 @@ def detect_elements(page_path: str, conf: float = 0.20, device: str = None) -> l
     return out
 
 
-# -- stage 2: grouping ----------------------------------------------------
-
-GROUP_PROMPT = """This image is one full page of a printed newspaper.
-
-A layout detector found these regions. Each has an ID like R1, and a position
-given as column span and vertical span in PERCENT of the page:
-
-%s
-
-Decide which regions belong to the SAME news article. Do not transcribe body text.
-
-An article = one headline plus the body text, photo and caption belonging to it.
-- A story running across several columns is ONE article: list all its R-IDs.
-- Body text directly below or beside a title usually belongs to that title.
-- A figure and its caption belong to the article whose text sits beside them.
-- If one big headline sits above several separate stories, emit ONE article per
-  story and set "umbrella": true on each.
-- Advertisements get "type":"ad". The paper's nameplate gets "masthead".
-- Everything else is "article". Never use a region's layout label (title, plain
-  text, figure) as the "type".
-- Put ALL regions of one story in ONE entry. Do not emit the same headline twice.
-
-CRITICAL: "regions" must contain ONLY the R-ID numbers listed above (the number
-after the R). Never output coordinates or percentages there. Every region listed
-above must appear in exactly one entry.
-
-Return ONLY JSON with this schema. The field values below are placeholders
-describing the TYPE expected -- do not copy them:
-{"articles":[{"regions":[<one or more R-ID numbers>],
-"type":"<article|ad|masthead>","headline":"<headline text as printed>",
-"umbrella":<true|false>,"continued_on_page":<page number or null>,
-"confidence":<0.0-1.0>}]}"""
-
-
-def _listing(elements, W, H):
-    """
-    Describe regions positionally rather than in raw pixels.
-
-    Feeding a 7B model raw [x0,y0,x1,y1] invites it to echo those numbers back
-    as region ids -- observed exactly that, returning "regions":[163,248,1317].
-    Percentages of the page read as geometry, not as identifiers.
-    """
-    rows = []
-    for e in elements:
-        x0, y0, x1, y1 = e["bbox_px"]
-        rows.append("R%d %s | x %d-%d%% | y %d-%d%%"
-                    % (e["n"], e["kind"],
-                       round(x0 / W * 100), round(x1 / W * 100),
-                       round(y0 / H * 100), round(y1 / H * 100)))
-    return "\n".join(rows)
-
+# -- stage 2: grouping (Python + Shapely; see epaper.geometry) -------------
 
 TITLE_KINDS = ("title",)
 TEXTY = ("plain text", "plain_text", "title")
 
 
 def _xov(a, b):
-    """Horizontal overlap of two boxes as a fraction of the narrower one."""
-    lo, hi = max(a[0], b[0]), min(a[2], b[2])
-    if hi <= lo:
-        return 0.0
-    return (hi - lo) / float(max(1, min(a[2] - a[0], b[2] - b[0])))
+    """Horizontal overlap via Shapely (fraction of the narrower width)."""
+    return geometry.horizontal_overlap_ratio(a, b)
+
+
+def _dedupe_elements(elements: list) -> list:
+    """
+    Drop near-duplicate YOLO boxes (same region labelled title + plain_text).
+
+    Prefer title/figure over plain_text when IoU is high so the lower headline
+    is not stolen as body of the story above.
+    """
+    rank = {"title": 0, "figure": 1, "figure_caption": 2, "figure caption": 2,
+            "plain text": 5, "plain_text": 5}
+    ordered = sorted(
+        elements,
+        key=lambda e: (rank.get(e["kind"], 3),
+                       -((e["bbox_px"][2] - e["bbox_px"][0]) *
+                         (e["bbox_px"][3] - e["bbox_px"][1]))))
+    kept = []
+    for e in ordered:
+        if any(geometry.iou(e["bbox_px"], k["bbox_px"]) >= 0.7 for k in kept):
+            continue
+        kept.append(e)
+    kept.sort(key=lambda e: e["n"])
+    return kept
+
+
+def _blocked_by_intervening_title(anchor_bbox, block_bbox, titles, anchor_n) -> bool:
+    """
+    True if another title sits between anchor and block in the same column band.
+
+    Uses the block's x-span (not only mutual overlap with the intervening
+    title) so a wide headline cannot claim the next column's body past a
+    narrower headline that only covers part of the width.
+    """
+    ay2 = anchor_bbox[3]
+    by1 = block_bbox[1]
+    if by1 <= ay2:
+        return False
+    bcx = (block_bbox[0] + block_bbox[2]) / 2.0
+    for t in titles:
+        if t["n"] == anchor_n:
+            continue
+        tb = t["bbox_px"]
+        mid = (tb[1] + tb[3]) / 2.0
+        if not (ay2 < mid < by1):
+            continue
+        # Same column as the block, or overlaps both anchor and block.
+        covers_block = (tb[0] - 8) <= bcx <= (tb[2] + 8) or \
+            geometry.same_column(tb, block_bbox) or \
+            geometry.horizontal_overlap_ratio(tb, block_bbox) >= 0.20
+        same_band = geometry.same_column(anchor_bbox, tb) or \
+            geometry.horizontal_overlap_ratio(anchor_bbox, tb) >= 0.20
+        if covers_block and same_band:
+            return True
+        # Even without anchor overlap: a title directly above the block wins.
+        if covers_block and geometry.same_column(tb, block_bbox):
+            return True
+    return False
+
+
+def _next_title_y(anchor_bbox, titles, anchor_n) -> float:
+    """Top of the nearest later title that shares this column band."""
+    ay2 = anchor_bbox[3]
+    best = float("inf")
+    for t in titles:
+        if t["n"] == anchor_n:
+            continue
+        tb = t["bbox_px"]
+        if tb[1] < ay2 - 4:
+            continue
+        if geometry.same_column(anchor_bbox, tb) or \
+                geometry.horizontal_overlap_ratio(anchor_bbox, tb) >= 0.30:
+            best = min(best, float(tb[1]))
+    return best
+
+
+def _clip_members_at_next_title(groups: list, titles: list, H: int) -> list:
+    """Drop members that fall below a later title in the same column."""
+    for g in groups:
+        tb = g["title"]["bbox_px"]
+        y_cap = _next_title_y(tb, titles, g["title"]["n"])
+        kept = []
+        for m in g["members"]:
+            mb = m["bbox_px"]
+            if not geometry.same_column(tb, mb):
+                continue
+            if _blocked_by_intervening_title(tb, mb, titles, g["title"]["n"]):
+                continue
+            # Hard stop at the next headline in this band — even if the member
+            # sits in a sub-column the intervening title does not fully cover.
+            if mb[1] >= y_cap - 2:
+                continue
+            # Hard cap: body more than ~15% of page below the headline is a
+            # different story on dense broadsheets (Sakshi-style).
+            dy = geometry.vertical_gap(tb, mb)
+            is_fig = m["kind"] in ("figure", "figure_caption", "figure caption")
+            if dy > (0.18 * H if is_fig else 0.12 * H):
+                continue
+            # Trim members that straddle the next title.
+            if mb[3] > y_cap and y_cap < float("inf"):
+                mb = list(mb)
+                mb[3] = y_cap - 2
+                if mb[3] - mb[1] < 12:
+                    continue
+                m = dict(m)
+                m["bbox_px"] = mb
+            kept.append(m)
+        g["members"] = kept
+    return groups
 
 
 def _assign_to_titles(elements, W, H):
     """
     Assign every non-title region to the title that owns it.
 
-    Bands were the wrong unit: a horizontal strip of a broadsheet holds several
-    stories side by side, so asking a 7B model to "group these regions" made it
-    lump all of them under whichever headline it noticed first -- one 66-element
-    box covering most of a page.
-
     Titles are the right unit. Each headline owns exactly one story, and the
     ownership rule a typesetter uses is simple: a block belongs to the nearest
-    headline ABOVE it whose horizontal span covers it. That is geometry over
-    semantic elements YOLO already identified, which is a very different and far
-    easier problem than cutting whitespace on raw pixels.
+    headline ABOVE it whose horizontal span covers it. Overlap / gap math uses
+    Shapely (epaper.geometry).
     """
+    elements = _dedupe_elements(elements)
     cand = [e for e in elements if e["kind"] in TITLE_KINDS]
     # YOLO labels bylines and section tags ("STATESMAN NEWS SERVICE", "SPORTS")
     # as titles too. Left as anchors they swallow whole page halves -- one such
@@ -255,6 +310,10 @@ def _assign_to_titles(elements, W, H):
     titles = [e for e in cand if (e["bbox_px"][3] - e["bbox_px"][1]) >= floor]
     demoted = [e for e in cand if e not in titles]
     others = [e for e in elements if e["kind"] not in TITLE_KINDS] + demoted
+    # Never attach a box that is basically another title detection.
+    title_boxes = [t["bbox_px"] for t in titles]
+    others = [o for o in others
+              if not any(geometry.iou(o["bbox_px"], tb) >= 0.55 for tb in title_boxes)]
     if not titles:
         return [], others
 
@@ -262,31 +321,79 @@ def _assign_to_titles(elements, W, H):
     orphans = []
     for o in others:
         ob = o["bbox_px"]
-        best, best_score = None, 0.0
+        oh = max(1.0, ob[3] - ob[1])
+        is_fig = o["kind"] in ("figure", "figure_caption", "figure caption")
+        max_dy = 0.16 * H if is_fig else 0.10 * H
+        # Nearest title ABOVE wins. Scoring by overlap alone let a wide
+        # headline steal body that sits under a closer, narrower headline.
+        best, best_key = None, None
         for t in titles:
             tb = t["bbox_px"]
-            ov = _xov(tb, ob)
-            if ov < 0.25:
+            if not geometry.same_column(tb, ob):
                 continue
-            # Title must sit above the block, or overlap it slightly (a headline
-            # beside a standfirst). Penalise distance so the NEAREST wins.
-            dy = ob[1] - tb[3]
-            if dy < -0.25 * (ob[3] - ob[1]):
+            ov = geometry.horizontal_overlap_ratio(tb, ob)
+            if ov < 0.22:
                 continue
-            # A story does not run half a page below its own headline. Without
-            # this cap a block whose real headline was filtered out attaches to
-            # whatever headline sits above it, stretching one box down the page.
-            if dy > 0.28 * H:
+            dy = geometry.vertical_gap(tb, ob)  # block.top - title.bottom
+            dy_above = tb[1] - ob[3]           # title.top - block.bottom
+            # Plain text never attaches above the headline — that was a major
+            # source of cross-story mega-crops on dense Telugu pages.
+            above_fig = False
+            if dy < -0.20 * oh:
+                if not (is_fig and -0.15 * oh <= dy_above <= 0.10 * H):
+                    continue
+                above_fig = True
+            if (not above_fig) and dy > max_dy:
                 continue
-            score = ov * 100.0 - max(0.0, dy) / float(H) * 100.0
-            if score > best_score:
-                best, best_score = t, score
+            if (not above_fig) and _blocked_by_intervening_title(
+                    tb, ob, titles, t["n"]):
+                continue
+            if above_fig:
+                # Prefer the title closest below the figure.
+                key = (1, max(0.0, dy_above), -ov)
+            else:
+                key = (0, max(0.0, dy), -ov)
+            if best_key is None or key < best_key:
+                best, best_key = t, key
         if best is not None:
             groups[best["n"]]["members"].append(o)
         else:
             orphans.append(o)
-    return list(groups.values()), orphans
-
+    out = _clip_members_at_next_title(list(groups.values()), titles, H)
+    # Members dropped by the next-title clip become orphans so a lower
+    # headline can claim them on a repair pass.
+    claimed = {m["n"] for g in out for m in g["members"]}
+    claimed |= {g["title"]["n"] for g in out}
+    leftover = [o for o in others if o["n"] not in claimed]
+    # Repair: assign leftover blocks to the nearest title above (strict).
+    still = []
+    for o in leftover:
+        ob = o["bbox_px"]
+        oh = max(1.0, ob[3] - ob[1])
+        is_fig = o["kind"] in ("figure", "figure_caption", "figure caption")
+        max_dy = 0.14 * H if is_fig else 0.10 * H
+        best, best_key = None, None
+        for g in out:
+            t = g["title"]
+            tb = t["bbox_px"]
+            if not geometry.same_column(tb, ob):
+                continue
+            dy = geometry.vertical_gap(tb, ob)
+            if dy < -0.05 * oh or dy > max_dy:
+                continue
+            if _blocked_by_intervening_title(tb, ob, titles, t["n"]):
+                continue
+            y_cap = _next_title_y(tb, titles, t["n"])
+            if ob[1] >= y_cap - 2:
+                continue
+            key = (max(0.0, dy), -geometry.horizontal_overlap_ratio(tb, ob))
+            if best_key is None or key < best_key:
+                best, best_key = g, key
+        if best is not None:
+            best["members"].append(o)
+        else:
+            still.append(o)
+    return out, still
 
 HEADLINE_PROMPT = """This image is a headline cut from a newspaper page.
 
@@ -297,24 +404,13 @@ Return ONLY JSON:
 {"headline":"<text as printed>","is_ad":<true|false>}"""
 
 
-def _read_headline(page_path, box, pad=8, lang=None):
+def _read_headline(page_path, box, pad=20, lang=None):
     """
     Read one headline.
 
-    This runs once per title candidate, and there are more of those than the
-    "a small crop, so this is fast" comment suggested: 18 on a Tribune front
-    page, ~19 s each through the vision model, which profiling put at 344 s of
-    a 475 s extraction -- 72% of the whole job.
-
-    So OCR reads it by default. The README's case against OCR is about raster
-    order over a whole page, which does not apply once YOLO has isolated a
-    single headline box; what is left is a strip of large bold type. Tesseract
-    does that in milliseconds on CPU.
-
-    The cost is the `is_ad` flag, which only the VLM prompt produced. Ad
-    detection falls back to the geometric figure-ratio test alone, which is
-    weaker. EPAPER_HEADLINE=vlm restores the old behaviour; =auto uses OCR and
-    retries with the VLM only when OCR returns nothing legible.
+    Returns (text, is_ad, meta) where meta has backend/error for job diagnostics.
+    Empty text on OCR failure is accompanied by meta["error"] — callers must
+    not treat silence as a successful blank headline.
     """
     from PIL import Image as _I
     with _I.open(page_path) as im:
@@ -323,26 +419,26 @@ def _read_headline(page_path, box, pad=8, lang=None):
                                        min(im.width, x1 + pad),
                                        min(im.height, y1 + pad)))
 
-    # "ocr" by default. "auto" was tried and abandoned: only 3 of 18 crops
-    # triggered a fallback, but at 7-20 s each they ate the saving, leaving
-    # 1.8x instead of 16x. The deciding evidence was that the model garbles the
-    # same words -- it returned "Proud oftaggiven" and "PChidambaram" too --
-    # so paying for it buys differently-broken text, not correct text. The
-    # fused-run matching in keywords.py handles the damage instead, on both
-    # engines' output. "auto" and "vlm" remain available.
-    mode = os.environ.get("EPAPER_HEADLINE", "ocr").lower()
+    meta = {"backend": None, "error": "", "empty": True}
+    # auto: IndicOCR first, VLM if empty/unreliable (fewer blank headlines).
+    mode = os.environ.get("EPAPER_HEADLINE", "auto").lower()
     if mode in ("ocr", "auto"):
-        text = ocr.read_headline(crop, lang=lang)
+        detail = ocr.read_headline_detail(crop, lang=lang)
+        meta = {k: detail.get(k) for k in ("backend", "error", "empty")}
+        text = detail.get("text") or ""
         if mode == "ocr":
-            return text, False
+            return text, False, meta
         if text and not ocr.looks_unreliable(text):
-            return text, False
+            return text, False, meta
 
     try:
         d = vlm.chat_json(HEADLINE_PROMPT, crop, max_edge=900, max_tokens=300)
-    except Exception:
-        return "", False
-    return (d.get("headline") or "").strip(), bool(d.get("is_ad"))
+        text = (d.get("headline") or "").strip()
+        meta = {"backend": "vlm", "error": "", "empty": not bool(text)}
+        return text, bool(d.get("is_ad")), meta
+    except Exception as ex:
+        meta = {"backend": "vlm", "error": str(ex)[:200], "empty": True}
+        return "", False, meta
 
 
 # Only explicit agency markers. An earlier version also matched "City, 11 Month"
@@ -367,14 +463,94 @@ def _is_byline(text: str) -> bool:
 
 
 def _figure_ratio(members, box):
-    area = max(1, (box[2] - box[0]) * (box[3] - box[1]))
-    fig = sum((m["bbox_px"][2] - m["bbox_px"][0]) * (m["bbox_px"][3] - m["bbox_px"][1])
-              for m in members if m["kind"] == "figure")
-    return fig / float(area)
+    figs = [m["bbox_px"] for m in members if m["kind"] == "figure"]
+    return geometry.figure_area_ratio(figs, box)
+
+
+def _pair_captions(members: list) -> list:
+    """
+    Tag figure_caption members with the nearest figure id (diagnostic only).
+    Does not reassign ownership — captions already belong to a title group.
+    Distance uses Shapely centroids.
+    """
+    figs = [m for m in members if m["kind"] == "figure"]
+    if not figs:
+        return members
+    out = []
+    for m in members:
+        if m["kind"] not in ("figure_caption", "figure caption"):
+            out.append(m)
+            continue
+        cb = m["bbox_px"]
+        best, best_d = None, 1e18
+        for f in figs:
+            fb = f["bbox_px"]
+            d = geometry.center_distance2(cb, fb)
+            # Prefer captions below the figure; penalise captions far above.
+            dy = geometry.vertical_gap(fb, cb)
+            if dy < -abs(fb[3] - fb[1]):
+                d *= 3.0
+            if d < best_d:
+                best, best_d = f, d
+        mm = dict(m)
+        if best is not None:
+            mm["caption_for"] = best["n"]
+        out.append(mm)
+    return out
+
+def _attach_orphans(groups: list, orphans: list, W: int, H: int):
+    """
+    Conservative second pass for leftovers.
+
+    - Figures: only tight, same-column hero photos above/below a headline.
+    - Plain text: only a short deck/standfirst sitting immediately ABOVE its
+      headline (common on Indian fronts). Never reach across the page.
+    """
+    if not groups or not orphans:
+        return groups, orphans
+    titles = [g["title"] for g in groups]
+    still = []
+    for o in orphans:
+        ob = o["bbox_px"]
+        oh = max(1.0, ob[3] - ob[1])
+        is_fig = o["kind"] in ("figure", "figure_caption", "figure caption")
+        is_text = o["kind"] in ("plain text", "plain_text")
+        if not (is_fig or is_text):
+            still.append(o)
+            continue
+        best, best_score = None, -1e9
+        for g in groups:
+            tb = g["title"]["bbox_px"]
+            if not geometry.same_column(tb, ob):
+                continue
+            ov = geometry.horizontal_overlap_ratio(tb, ob)
+            if ov < 0.28:
+                continue
+            dy_below = geometry.vertical_gap(tb, ob)
+            dy_above = tb[1] - ob[3]
+            score = None
+            if is_fig:
+                if -0.2 * oh <= dy_below <= 0.08 * H:
+                    if _blocked_by_intervening_title(tb, ob, titles, g["title"]["n"]):
+                        continue
+                    score = ov * 100.0 - abs(max(0.0, dy_below)) / float(H) * 100.0
+                elif -0.15 * oh <= dy_above <= 0.08 * H:
+                    score = ov * 100.0 - abs(max(0.0, dy_above)) / float(H) * 100.0 + 5.0
+            else:
+                # Deck immediately above headline only.
+                if 0.0 <= dy_above <= 0.05 * H and oh < 0.12 * H:
+                    score = ov * 100.0 - dy_above / float(H) * 120.0
+            if score is not None and score > best_score:
+                best, best_score = g, score
+        if best is not None and best_score > 25.0:
+            best["members"].append(o)
+        else:
+            still.append(o)
+    return groups, still
 
 
 def group_articles(page_path: str, elements: list, lang=None) -> list:
-    """Title-anchored grouping: geometry proposes, the VLM reads each headline."""
+    """Title-anchored grouping: geometry proposes, OCR/VLM reads each headline."""
     from PIL import Image as _I
     with _I.open(page_path) as im:
         W, H = im.size
@@ -397,6 +573,7 @@ def group_articles(page_path: str, elements: list, lang=None) -> list:
               if e["kind"] not in TITLE_KINDS or e["n"] not in rejected]
 
     groups, orphans = _assign_to_titles(usable, W, H)
+    groups, orphans = _attach_orphans(groups, orphans, W, H)
     if not groups:
         raise LocalBackendError("no titles detected on %s; cannot anchor articles"
                                 % os.path.basename(page_path))
@@ -404,19 +581,63 @@ def group_articles(page_path: str, elements: list, lang=None) -> list:
     arts = []
     for g in groups:
         t = g["title"]
-        members = g["members"]
-        boxes = [t["bbox_px"]] + [m["bbox_px"] for m in members]
-        box = [min(b[0] for b in boxes), min(b[1] for b in boxes),
-               max(b[2] for b in boxes), max(b[3] for b in boxes)]
-        headline, is_ad = texts.get(t["n"], ("", False))
+        members = _pair_captions(g["members"])
+        # Clip members to the title column before union so a partially
+        # overlapping banner figure cannot inflate the crop across the page.
+        clipped_boxes = [t["bbox_px"]]
+        clipped_members = []
+        for m in members:
+            cb = geometry.clip_box_to_column(t["bbox_px"], m["bbox_px"])
+            if cb is None:
+                continue
+            mm = dict(m)
+            mm["bbox_px"] = cb
+            clipped_members.append(mm)
+            clipped_boxes.append(cb)
+        members = clipped_members
+        box = geometry.union_bbox(clipped_boxes)
+        # Guard: never let one story span > ~55% page width unless the title
+        # itself is that wide (banner headline).
+        tw = max(1.0, t["bbox_px"][2] - t["bbox_px"][0])
+        if (box[2] - box[0]) > max(1.35 * tw, 0.55 * W) and tw < 0.45 * W:
+            pad = max(48.0, 0.55 * tw)
+            box = [max(box[0], t["bbox_px"][0] - pad), box[1],
+                   min(box[2], t["bbox_px"][2] + pad), box[3]]
+        # Clip bottom at the next headline in this column band.
+        y_cap = _next_title_y(t["bbox_px"], [g["title"] for g in groups], t["n"])
+        if y_cap < float("inf") and box[3] > y_cap:
+            box = [box[0], box[1], box[2], max(box[1] + 8, y_cap - 2)]
+        headline, is_ad, ocr_meta = texts.get(t["n"], ("", False, {}))
         kinds = sorted({m["kind"] for m in members} | {t["kind"]})
         figr = _figure_ratio(members, box)
-        kind = "ad" if (is_ad or figr > 0.65) else "article"
-        if box[1] < H * 0.06 and (box[2] - box[0]) > W * 0.55:
+        # Ads: model flag, or almost-all-figure with little/no headline text.
+        kind = "ad" if (is_ad or (figr > 0.70 and len(headline) < 8)) else "article"
+        # Masthead: top band, wide, few body paragraphs.
+        plainish = sum(1 for m in members
+                       if m["kind"] in ("plain text", "plain_text"))
+        if (box[1] < H * 0.08 and (box[2] - box[0]) > W * 0.50
+                and plainish <= 1 and (box[3] - box[1]) < 0.22 * H):
             kind = "masthead"
+        # Strip leaked JSON fragments from OCR/VLM headline quirks.
+        if headline and ("is_ad" in headline or '"is_ad"' in headline
+                         or headline.strip().startswith("{")):
+            for sep in (",'", '","', '",', ", \""):
+                if sep in headline:
+                    headline = headline.split(sep)[0]
+                    break
+            headline = headline.strip(" {}\\\"'").strip()
+        # Record geometry engine for diagnostics / health reports.
+        geom_engine = "shapely"
+        status = "ok"
+        if kind == "article" and not headline and ocr_meta.get("error"):
+            status = "partial"
         arts.append({
             "type": kind,
             "headline_visible": headline,
+            "headline_ocr": headline,
+            "ocr_backend": ocr_meta.get("backend"),
+            "ocr_error": ocr_meta.get("error") or None,
+            "extraction_status": status,
             "continued_on_page": None,
             "package": False,
             # Per-element boxes, kept rather than collapsed into the article
@@ -426,7 +647,9 @@ def group_articles(page_path: str, elements: list, lang=None) -> list:
             # only -- body text per region needs OCR, which does not run here.
             "region_boxes": (
                 [{"type": "headline", "bbox": list(t["bbox_px"]), "text": headline}]
-                + [{"type": m["kind"], "bbox": list(m["bbox_px"]), "text": ""}
+                + [{"type": m["kind"], "bbox": list(m["bbox_px"]), "text": "",
+                    **({"caption_for": m["caption_for"]}
+                       if m.get("caption_for") is not None else {})}
                    for m in members]),
             "elements": sorted([t["n"]] + [m["n"] for m in members]),
             "element_kinds": kinds,
@@ -434,21 +657,34 @@ def group_articles(page_path: str, elements: list, lang=None) -> list:
             "grouping_confidence": round(min(1.0, 0.4 + 0.1 * len(members)), 2),
             "figure_ratio": round(figr, 2),
             "bbox_px": box,
-            "detector": "doclayout-yolo(titles)+%s" % vlm.MODEL,
+            "geometry": geom_engine,
+            "detector": "doclayout-yolo(titles)+shapely+%s" % vlm.MODEL,
         })
 
-    # Orphaned blocks -- no headline above them -- are usually standalone photos
-    # or ad copy. Emitted rather than dropped: a missing region is a lost story.
+    # Orphaned blocks — no headline owned them. Emitting every leftover as an
+    # empty article created duplicate/junk cards on dense pages. Only keep
+    # compact figure orphans that look like standalone ads/photos.
+    covered = [a["bbox_px"] for a in arts]
     for o in orphans:
+        if o["kind"] not in ("figure",):
+            continue
         b = o["bbox_px"]
-        if (b[2] - b[0]) < W * 0.05 or (b[3] - b[1]) < H * 0.015:
+        bw, bh = b[2] - b[0], b[3] - b[1]
+        if bw < W * 0.06 or bh < H * 0.02:
+            continue
+        # Page-wide top banners belong with the masthead, not as a lone ad crop.
+        if bw > 0.55 * W or (b[1] < 0.08 * H and bw > 0.40 * W):
+            continue
+        if any(geometry.iou(b, cb) >= 0.5 or (
+                cb[0] <= (b[0] + b[2]) / 2 <= cb[2]
+                and cb[1] <= (b[1] + b[3]) / 2 <= cb[3]) for cb in covered):
             continue
         arts.append({
-            "type": "ad" if o["kind"] == "figure" else "article",
+            "type": "ad",
             "headline_visible": "", "continued_on_page": None, "package": False,
             "elements": [o["n"]], "element_kinds": [o["kind"]],
-            "has_photo": o["kind"] == "figure", "grouping_confidence": 0.2,
-            "figure_ratio": 1.0 if o["kind"] == "figure" else 0.0,
+            "has_photo": True, "grouping_confidence": 0.2,
+            "figure_ratio": 1.0,
             "bbox_px": list(b), "unassigned": True,
             "detector": "doclayout-yolo(orphan)",
         })
@@ -487,14 +723,33 @@ def _same_story(a, b):
 
     The model returned both "NASA invites ISRO to join ambitious Moon Base progra"
     and "join ambitious Moon Base programme" for one story; exact matching kept
-    them as two articles.
+    them as two articles. Short OCR collisions (≤10 chars) are NOT enough on
+    their own — callers must also check spatial proximity.
     """
     if not a or not b:
         return False
     if a == b:
-        return True
+        return len(a) >= 8
     short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    return len(short) >= 12 and (short in long_ or long_.startswith(short))
+    return len(short) >= 14 and (short in long_ or long_.startswith(short))
+
+
+def _boxes_mergeable(a, b) -> bool:
+    """Same-story merge only when boxes share a column and are not far apart."""
+    if not (geometry.same_column(a, b) or
+            geometry.horizontal_overlap_ratio(a, b) >= 0.30):
+        return False
+    if a[3] < b[1]:
+        gap = b[1] - a[3]
+    elif b[3] < a[1]:
+        gap = a[1] - b[3]
+    else:
+        gap = 0.0
+    # Distinct columns that OCR to the same short string are often far apart
+    # vertically; refuse to weld them into one crop.
+    if gap > 400:
+        return False
+    return True
 
 
 def _merge_by_headline(arts, by_n):
@@ -504,7 +759,8 @@ def _merge_by_headline(arts, by_n):
     The model reliably identifies WHICH story a region belongs to -- it repeats
     that story's headline on each region -- but it emits them as separate
     entries instead of one grouped entry. Merging on the headline recovers the
-    grouping it already worked out.
+    grouping it already worked out. Spatial checks stop short OCR collisions
+    from welding unrelated columns into a page-tall mega-crop.
     """
     merged, order = {}, []
     for a in arts:
@@ -517,7 +773,8 @@ def _merge_by_headline(arts, by_n):
             continue
         hit = None
         for (mk, mt), cand in merged.items():
-            if mt == a["type"] and _same_story(mk, key):
+            if mt == a["type"] and _same_story(mk, key) and \
+                    _boxes_mergeable(cand["bbox_px"], a["bbox_px"]):
                 hit = cand
                 break
         if hit is None:
@@ -526,43 +783,26 @@ def _merge_by_headline(arts, by_n):
             continue
         m = hit
         m["elements"] = sorted(set(m["elements"]) | set(a["elements"]))
-        b1, b2 = m["bbox_px"], a["bbox_px"]
-        m["bbox_px"] = [min(b1[0], b2[0]), min(b1[1], b2[1]),
-                        max(b1[2], b2[2]), max(b1[3], b2[3])]
-        m["element_kinds"] = sorted({by_n[n]["kind"] for n in m["elements"]})
-        m["has_photo"] = any(by_n[n]["kind"] == "figure" for n in m["elements"])
+        m["bbox_px"] = geometry.union_bbox([m["bbox_px"], a["bbox_px"]])
+        # Keep region_boxes in sync so the UI overlay matches the crop.
+        if m.get("region_boxes") is not None and a.get("region_boxes"):
+            m["region_boxes"] = list(m["region_boxes"]) + list(a["region_boxes"])
+        m["element_kinds"] = sorted({by_n[n]["kind"] for n in m["elements"]
+                                      if n in by_n} or set(m.get("element_kinds") or []))
+        m["has_photo"] = m.get("has_photo") or a.get("has_photo") or \
+            any(by_n.get(n, {}).get("kind") == "figure" for n in m["elements"])
         m["package"] = m["package"] or a["package"]
         m["continued_on_page"] = m["continued_on_page"] or a["continued_on_page"]
     return [a for a in order if a in merged.values() or not _norm_headline(a["headline_visible"])]
 
 
-def _ints(v):
-    """Region ids may arrive as ints, "R7", or "7"."""
-    out = []
-    for x in (v or []):
-        if isinstance(x, int):
-            out.append(x)
-        elif isinstance(x, str):
-            d = "".join(c for c in x if c.isdigit())
-            if d:
-                out.append(int(d))
-    return out
-
-
-def _used_ids(data, valid):
-    if not isinstance(data, dict):
-        return set()
-    return {n for a in data.get("articles", []) or []
-            for n in _ints(a.get("regions")) if n in valid}
-
-
-# -- stage 3: reading -----------------------------------------------------
+# -- stage 3: reading (Qwen2.5-VL) ----------------------------------------
 
 READ_PROMPT = """This image is ONE article cut from a newspaper page.
 
 Transcribe what is printed. Keep the original script and language. Do not
-summarise, do not translate, do not invent text that is cut off at the edge.
-Use null for any field that is not present.
+translate. Do not invent names, places, dates or facts that are not visible.
+Use null or [] for any field that is not present on the page.
 
 The values below in <angle brackets> describe the TYPE of content expected.
 They are placeholders. Never copy them into your answer.
@@ -571,7 +811,10 @@ Return ONLY JSON:
 {"headline":"<headline exactly as printed>","subheadline":null,"kicker":null,
  "byline":null,"dateline":null,"location":null,
  "body":"<every paragraph of the body text, blank line between paragraphs>",
+ "summary":null,
  "photo_captions":[],"continued_on_page":null,
+ "keywords":[],"people":[],"organizations":[],"events":[],"places":[],
+ "topics":[],
  "transcription_confidence":0.0}"""
 
 # The topic label used to be asked for here, in the same breath as the
@@ -583,11 +826,8 @@ Return ONLY JSON:
 
 
 # What the model returns when it describes the field instead of filling it.
-# The prompt now says not to, and GROUP_PROMPT has carried that warning all
-# along, but a 7B model still does it occasionally and the result is worse
-# than an empty body: it is fluent English that gets indexed, searched and
-# shown to a reader as though it were the article. Observed once on a Jansatta
-# page, stored in MongoDB, and only caught by eye.
+# A 7B model still echoes schema placeholders occasionally; catching them
+# avoids indexing fluent English that is not the article.
 _PLACEHOLDER_HINTS = (
     "paragraphs separated by blank lines",
     "blank line between paragraphs",
@@ -629,12 +869,24 @@ def _real(text, field: str) -> str:
 
 
 def transcribe(crop_path: str) -> dict:
-    """Read one article crop into structured fields."""
-    out = vlm.chat_json(READ_PROMPT, crop_path, max_edge=1280, max_tokens=3000)
+    """Read one article crop into structured fields (validated when possible)."""
+    # 4500: Telugu front pages often truncate at 3000 mid-JSON ("subheadline": nul).
+    out = vlm.chat_json(READ_PROMPT, crop_path, max_edge=1280, max_tokens=4500)
     if isinstance(out, dict):
-        for field in ("headline", "body"):
-            out[field] = _real(out.get(field), field)
-    return out
+        for field in ("headline", "body", "summary"):
+            if field in out:
+                out[field] = _real(out.get(field), field)
+        try:
+            from .schemas import validate_vlm_dict
+            validated = validate_vlm_dict(out)
+            data = validated.model_dump()
+            # Keep raw model payload for debugging; do not lose unmapped keys.
+            data["raw"] = out
+            return data
+        except Exception:
+            out.setdefault("raw", dict(out))
+            return out
+    return {"headline": "", "body": "", "raw": out, "transcription_error": "non-dict"}
 
 
 # -- inspection artefacts -------------------------------------------------
@@ -663,7 +915,7 @@ def debug_dir_for(paper, date, page_no) -> str:
 def detect_regions(page_path: str, page_no: int = 1, paper: str = "", date: str = "",
                    debug: bool = True, lang: str | None = None) -> list:
     """
-    Drop-in replacement for segment.detect_regions / autosegment.detect_regions.
+    DocLayout-YOLO + Shapely grouping for one page.
 
     Writes elements.json, grouping.json and two annotated previews so the
     boundaries can be checked by eye before a full run.
@@ -725,19 +977,28 @@ def health() -> dict:
             st["layout_error"] = "layout service unreachable at %s: %s" % (LAYOUT_URL, ex)
             st["doclayout_yolo"] = False
         st["vlm"] = vlm.health()
+        st["ocr"] = ocr.health()
         st["ready"] = bool(st["weights_present"] and st["doclayout_yolo"]
                            and st["vlm"].get("available"))
         return st
 
     st = {"mode": "local", "weights_path": YOLO_W,
           "weights_present": os.path.exists(YOLO_W),
-          "doclayout_yolo": False, "cuda": False, "gpu": None}
+          "doclayout_yolo": False, "cuda": False, "gpu": None,
+          "device": _default_device()}
     try:
         import torch
         st["torch"] = torch.__version__
         st["cuda"] = bool(torch.cuda.is_available())
+        mps = getattr(torch.backends, "mps", None)
+        st["mps"] = bool(mps is not None and mps.is_available())
         if st["cuda"]:
             st["gpu"] = torch.cuda.get_device_name(0)
+        elif st["mps"]:
+            st["gpu"] = "Apple MPS"
+        forced = (os.environ.get("EPAPER_DEVICE") or "").strip()
+        if forced:
+            st["device"] = forced
     except Exception as ex:
         st["torch_error"] = str(ex)[:200]
     try:
@@ -747,6 +1008,7 @@ def health() -> dict:
         st["doclayout_error"] = str(ex)[:200]
 
     st["vlm"] = vlm.health()
+    st["ocr"] = ocr.health()
     st["ready"] = bool(st["weights_present"] and st["doclayout_yolo"]
                        and st["vlm"].get("available"))
     return st

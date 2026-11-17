@@ -1,0 +1,17 @@
+settings_version: 0.0.4
+datasets_dir: /Users/bcss/Desktop/e-paper/datasets
+weights_dir: /Users/bcss/Desktop/e-paper/weights
+runs_dir: /Users/bcss/Desktop/e-paper/runs
+uuid: 7a15b025735c9790f77bfd4ea54b1216d4c0ced32c6db3a99a16d6f8d3f8ecf4
+sync: true
+api_key: ''
+openai_api_key: ''
+clearml: true
+comet: true
+dvc: true
+hub: true
+mlflow: true
+neptune: true
+raytune: true
+tensorboard: true
+wandb: true

@@ -2,6 +2,8 @@
 # keyword layer, which deliberately needs nothing heavier.
 Pillow>=9.0
 pymongo>=4.0
+# PDF upload → page image (replaces poppler/pdftoppm).
+pymupdf>=1.24,<2
 
 # Connection settings live in a gitignored .env; epaper/config.py reads it.
 # python-dotenv is optional -- config.py falls back to its own parser -- but
@@ -40,6 +42,13 @@ huggingface_hub>=0.20
 
 # The vision model is NOT a Python dependency -- it is a separate server.
 # See README "Local backend": ollama pull qwen2.5vl:7b (or :3b under ~4GB VRAM).
+
+# Optional image quality / preprocessing (epaper/preprocess.py).
+# Safe to omit; quality_report skips blur metrics when OpenCV is absent.
+opencv-python-headless>=4.8
+pydantic>=2.0
+# Article grouping geometry (epaper/geometry.py + local_backend).
+shapely>=2.0
 
 # Tests (tests/, see tests/README.md). Not needed to run the app.
 #   pip install pytest && pytest
