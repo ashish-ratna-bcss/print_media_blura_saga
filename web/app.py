@@ -159,7 +159,7 @@ CATALOGUE = [
     # 2438x4000 it is the highest-resolution source here -- larger than
     # Readwhere's stitched 2400px tiles, from a single image with no login.
     {"name": "Hindustan", "host": "epaper.livehindustan.com", "lang": "hi",
-     "platform": "livehindustan", "states": ["UP", "BR", "DL"]},
+     "platform": "livehindustan", "states": ["UP", "BR", "DL", "JH", "UK"]},
 ]
 
 
@@ -1403,6 +1403,32 @@ def expand(topic: str):
             "terms": kw["terms"]}
 
 
+# Hindustan serves these Jharkhand editions free and without a paywall, but its edition
+# dropdown (the only list the site publishes) leaves them out. Slug -> Devanagari name.
+_LH_EXTRA_V2 = True
+_LH_EXTRA_EDITIONS = {
+    # Jharkhand
+    "jamshedpur": ("जमशेदपुर", "झारखंड"), "dhanbad": ("धनबाद", "झारखंड"), "bokaro": ("बोकारो", "झारखंड"),
+    "deoghar": ("देवघर", "झारखंड"), "hazaribagh": ("हजारीबाग", "झारखंड"), "giridih": ("गिरिडीह", "झारखंड"),
+    "ramgarh": ("रामगढ़", "झारखंड"), "palamu": ("पलामू", "झारखंड"), "dumka": ("दुमका", "झारखंड"),
+    "chaibasa": ("चाईबासा", "झारखंड"), "koderma": ("कोडरमा", "झारखंड"), "garhwa": ("गढ़वा", "झारखंड"),
+    "khunti": ("खूंटी-खलारी", "झारखंड"),
+    # Uttarakhand
+    "haridwar": ("हरिद्वार", "उत्तराखंड"), "roorkee": ("रुड़की", "उत्तराखंड"),
+    "almora": ("अल्मोड़ा", "उत्तराखंड"), "pithoragarh": ("पिथोरागढ़", "उत्तराखंड"),
+    # Delhi-NCR
+    "gurgaon": ("गुडगाँव", "दिल्ली-एनसीआर"), "noida": ("नोएडा", "दिल्ली-एनसीआर"),
+    "ghaziabad": ("गाज़ियाबाद", "दिल्ली-एनसीआर"), "faridabad": ("फरीदाबाद", "दिल्ली-एनसीआर"),
+    # Uttar Pradesh
+    "aligarh": ("अलीगढ़", "उत्तर प्रदेश"), "saharanpur": ("सहारनपुर-देवबंद", "उत्तर प्रदेश"),
+    "mathura": ("मथुरा", "उत्तर प्रदेश"), "firozabad": ("फिरोजाबाद", "उत्तर प्रदेश"),
+    # Bihar
+    "muzaffarpur": ("मुजफ्फरपुर", "बिहार"), "bhagalpur": ("भागलपुर", "बिहार"), "gaya": ("गया", "बिहार"),
+    "darbhanga": ("दरभंगा", "बिहार"), "purnia": ("पूर्णिया", "बिहार"), "begusarai": ("बेगूसराय", "बिहार"),
+    "samastipur": ("समस्तीपुर", "बिहार"), "katihar": ("कटिहार", "बिहार"), "sitamarhi": ("सीतामढ़ी", "बिहार"),
+}
+
+
 @app.get("/api/editions")
 def editions(host: str):
     if host in _cache:
@@ -1420,6 +1446,9 @@ def editions(host: str):
                   "name": "%s (%s)" % (c["name"], c["region"]) if c["region"]
                           else c["name"]}
                  for c in LiveHindustan(host).cities()]
+            have = {e["id"] for e in t}
+            t += [{"id": slug, "name": "%s (%s)" % (name, region)}
+                  for slug, (name, region) in _LH_EXTRA_EDITIONS.items() if slug not in have]
         else:
             t = Readwhere(host).titles()
     except Exception as ex:
